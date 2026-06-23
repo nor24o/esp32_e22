@@ -134,10 +134,10 @@ struct __attribute__((packed)) LoRaHeader {
 };  // 6 bytes
 
 struct __attribute__((packed)) TelemetryData {
-    uint8_t  water_level;   // 0–3
+    uint8_t  water_level;   // 0–4
     uint8_t  system_flags;  // bit0=Auto bit1=P1 bit2=P2 bit3=P3 bit4=PondP
-    int16_t  temperature;   // °C × 10  (0 = DHT22 not fitted)
-    uint8_t  humidity;      // % RH     (0 = DHT22 not fitted)
+    int16_t  temperature;   // °C × 10
+    uint8_t  humidity;      // % RH
     uint8_t  error_code;    // 0=OK 1=OC 2=DryRun 3=Comms
     int8_t   last_rssi;     // dBm of last received packet
     int8_t   last_snr;      // SNR in dB
@@ -1072,7 +1072,7 @@ static void Task_UIAnimation(void *pvParams) {
             leds[4] = netFlashOn ? CRGB::Red : CRGB::Black;
 
         } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
-            leds[4] = CRGB(148, 0, 211);   // purple – RX
+            leds[4] = CRGB(148, 0, 211);   // purple - RX
 
         } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
             leds[4] = CRGB::Cyan;           // TX

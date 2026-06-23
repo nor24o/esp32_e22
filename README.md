@@ -115,7 +115,7 @@ LED:  [ 0 ][ 1 ][ 2 ][ 3 ][ 4 ][ 5 ][ 6 ][ 7 ][ 8 ][ 9 ]
 ### Mode and Pump LEDs (LEDs 5-9)
 
 | LED | GREEN / CYAN means | DIM means |
-|-----|-------------------|-----------|
+|-----|-------------------|----------|
 | 5 | Auto mode (green) | Manual mode (blue) |
 | 6 | Pump P1 running | P1 off (dim red) |
 | 7 | Pump P2 running | P2 off (dim red) |
