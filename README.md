@@ -10,7 +10,7 @@
               ┌─────────────────┐
               │  Gateway  0x01  │
               └────────┬────────┘
-                       │  LoRa 433 MHz
+                       │  LoRa 868 MHz
            ┌───────────┴────────────┐
            │                        │
   ┌────────▼────────┐     ┌─────────▼───────┐
@@ -130,8 +130,8 @@ LED:  [ 0 ][ 1 ][ 2 ][ 3 ][ 4 ][ 5 ][ 6 ][ 7 ][ 8 ][ 9 ]
   Auto mode       Float switches trigger pond pump automatically
   Manual mode     5 buttons control all pumps locally
   Pump hysteresis Min runtime + cooldown enforced per pump
-  Overcurrent     Immediate relay cutoff if ADC > threshold
-  Dry-run         Immediate cutoff if ADC < threshold (no water)
+  Overcurrent     Grace period filters inrush; warn or lockout (configurable)
+  Dry-run         Same grace period; warn or lockout (configurable)
   ACK handshake   Pond commands confirmed with retry logic
   Net monitoring  Tracks gateway + pond contact; flags timeout
   LED feedback    10-LED strip shows full system state
@@ -185,14 +185,15 @@ struct TelemetryData {
 ### RF Configuration
 
 ```
-  Frequency   433.0 MHz
+  Frequency   868.0 MHz  (EU ISM band)
   Bandwidth   125 kHz
-  SF          9
+  SF          9  (minimum; raise to SF10/SF11 for more margin at range)
   Coding rate 4/5
   Sync word   0x12
   TX power    22 dBm
   Preamble    8 symbols
-  Airtime     ~330 ms for 38 bytes  (transmit() blocks the LoRa task)
+  Airtime     ~330 ms for 38 bytes at SF9  (transmit() blocks the LoRa task)
+  Round-trip  ~700 ms CMD + ACK  →  ACK timeout default 10 s gives ample margin
 ```
 
 ---
@@ -202,18 +203,20 @@ struct TelemetryData {
 All parameters live in NVS, tunable over LoRa via `MSG_CONFIG_SET` without reflashing:
 
 ```
-  Parameter                 Default      Range                Description
-  ------------------------  ----------   -------------------  ----------------------------
-  pump_min_runtime_ms          30 000    5 000 - 3 600 000   Min ON time per pump
-  pump_min_cooldown_ms         60 000    5 000 - 3 600 000   Min OFF before restart
-  replenish_runon_ms          300 000   30 000 - 86 400 000  Min pond pump run (fill)
-  telemetry_interval_ms        30 000    5 000 - 3 600 000   Telemetry send period
-  network_timeout_ms           60 000   10 000 - 3 600 000   Contact timeout -> error
-  ack_timeout_ms                5 000    1 000 - 60 000       Wait for ACK before retry
-  overcurrent_thresh            3 200        0 - 4 095        ADC raw cutoff (12-bit)
-  dryrun_thresh                   150        0 - overcurrent  ADC raw floor
-  ack_max_retries                   3        1 - 10           Retries before comms error
-  boot_auto_mode                    1        0 or 1           Startup mode preference
+  Parameter                    Default      Range                Description
+  ---------------------------  ----------   -------------------  --------------------------------
+  pump_min_runtime_ms             30 000    5 000 - 3 600 000   Min ON time per pump
+  pump_min_cooldown_ms            60 000    5 000 - 3 600 000   Min OFF before restart
+  replenish_runon_ms             300 000   30 000 - 86 400 000  Min pond pump run (fill)
+  telemetry_interval_ms           30 000    5 000 - 3 600 000   Telemetry send period
+  network_timeout_ms              60 000   10 000 - 3 600 000   Contact timeout -> error
+  ack_timeout_ms                  10 000    1 000 - 60 000       Wait for ACK before retry
+  overcurrent_thresh               3 200        0 - 4 095        ADC raw cutoff (12-bit)
+  dryrun_thresh                      150        0 - overcurrent  ADC raw floor
+  ack_max_retries                      5        1 - 10           Retries before comms error
+  boot_auto_mode                       1        0 or 1           Startup mode preference
+  overcurrent_grace_ticks              5        0 - 255          Ticks (×50 ms) before fault trips
+  fault_lockout_enabled                1        0 or 1           1=kill relays  0=warn only
 ```
 
 ---
@@ -239,21 +242,27 @@ Stored in NVS, survives reboots, queryable via `MSG_STATS_GET`:
 ```
   Core 0                            Core 1
   +----------------------+          +----------------------+
-  |  LoRaTransceiver     |          |  InputSensorPoll     |
-  |  Priority 4          |          |  Priority 3  20 ms   |
-  |  Event-driven        |          |  Float switches      |
-  |  TX queue drain      |          |  Buttons (debounce)  |
-  |  RX ISR -> queue     |          |  ADC current (x8)    |
-  +----------+-----------+          +----------+-----------+
-             |  RX queue                       |  mutex
-  +----------v-----------+          +----------v-----------+
-  |  UIAnimation         |          |  ControlEngine       |
-  |  Priority 1  30 ms   |          |  Priority 2  50 ms   |
-  |  10-LED strip        |          |  State machine       |
-  |  Level/pump/net/mode |          |  Pump hysteresis     |
-  +----------------------+          |  ACK retry logic     |
-                                    |  Telemetry timer     |
+  |  LoRaTransceiver     |          |  ControlEngine       |
+  |  Priority 2          |          |  Priority 4  50 ms   |
+  |  Event-driven        |          |  Relay/pump logic    |
+  |  TX queue drain      |          |  OC grace counter    |
+  |  RX ISR -> queue     |          |  ACK retry logic     |
+  +----------+-----------+          |  Telemetry timer     |
+             |  RX queue            +----------+-----------+
+  +----------v-----------+                     |  mutex
+  |  UIAnimation         |          +----------v-----------+
+  |  Priority 1  30 ms   |          |  InputSensorPoll     |
+  |  10-LED strip        |          |  Priority 3  20 ms   |
+  |  Level/pump/net/mode |          |  Float switches      |
+  +----------------------+          |  Buttons (debounce)  |
+                                    |  ADC current (x8)    |
                                     +----------------------+
+
+  Priority rationale:
+    P4  ControlEngine   — relay decisions are most time-critical
+    P3  InputSensorPoll — must deliver fresh sensor data promptly
+    P2  LoRaTransceiver — comms important but not safety-critical
+    P1  UIAnimation     — display only; freely preemptable
 
   Shared resources:
     StateMutex          guards SystemState struct
@@ -271,7 +280,7 @@ Stored in NVS, survives reboots, queryable via `MSG_STATS_GET`:
 ```
   waterLevel == 0?
     YES -> canTurnPumpOn?
-             YES -> Send CMD(pond ON) -> start replenish timer -> await ACK (retry x3)
+             YES -> Send CMD(pond ON) -> start replenish timer -> await ACK (retry x5, 10 s timeout)
 
   waterLevel >= 3 AND runOn expired?
     YES -> canTurnPumpOff?
@@ -285,14 +294,24 @@ Stored in NVS, survives reboots, queryable via `MSG_STATS_GET`:
                                                   -> LoRa CMD if pond pump
 ```
 
-### Fault Lockout
+### Fault / Overcurrent
 
 ```
-  ADC > overcurrent_thresh  ->  Kill all relays  ->  errorCode = 1  ->  save NVS
-  ADC < dryrun_thresh       ->  Kill all relays  ->  errorCode = 2  ->  save NVS
+  Inrush grace:
+    ADC must exceed threshold for overcurrent_grace_ticks × 50 ms (default 250 ms)
+    before any action is taken — short inrush spikes are ignored.
 
-  To clear: press MODE button
-  Note: comms error (code 3) does NOT trigger lockout
+  fault_lockout_enabled = 1  (default):
+    ADC > overcurrent_thresh  ->  Kill all relays  ->  errorCode = 1  ->  save NVS
+    ADC < dryrun_thresh       ->  Kill all relays  ->  errorCode = 2  ->  save NVS
+    To clear: press MODE button
+
+  fault_lockout_enabled = 0  (warn-only):
+    Same conditions  ->  errorCode = 1 or 2  (LED shows fault colour)
+    Relays keep running; errorCode auto-clears when current returns to normal
+    Useful during commissioning or for systems with high inrush motors
+
+  Note: comms error (code 3) never triggers relay lockout in either mode
 ```
 
 ---
@@ -351,8 +370,8 @@ esp32_e22/
         +-- S10  Shared helpers (telemetry, ACK, commands)
         +-- S11  Pump hysteresis management
         +-- S12  Task: InputSensorPoll  (Core 1, P3, 20 ms)
-        +-- S13  Task: ControlEngine    (Core 1, P2, 50 ms)
-        +-- S14  Task: LoRaTransceiver  (Core 0, P4, event)
+        +-- S13  Task: ControlEngine    (Core 1, P4, 50 ms)
+        +-- S14  Task: LoRaTransceiver  (Core 0, P2, event)
         +-- S15  Task: UIAnimation      (Core 0, P1, 30 ms)
         +-- S16  setup()
         +-- S17  loop()  -- intentionally empty
