@@ -1,229 +1,330 @@
-# ESP32 E22 — Tank Water Level Controller Node (0x02)
+# ESP32 E22 — Tank Water Level Controller Node `0x02`
 
-A production-grade, LoRa-networked water level management system running on ESP32 + SX1262. Manages up to 3 local pumps and 1 remote pond pump with automatic level-based control, fault protection, and runtime configuration over LoRa.
+> LoRa-networked pump controller · ESP32 + SX1262 · FreeRTOS · 3 local pumps + 1 remote pond pump
 
 ---
 
 ## Network Topology
 
 ```
-[ Gateway 0x01 ]
-       |
-   LoRa 433 MHz
-       |
-[ Tank Node 0x02 ]  <--LoRa-->  [ Pond Node 0x03 ]
-    (this device)
+              ┌─────────────────┐
+              │  Gateway  0x01  │
+              └────────┬────────┘
+                       │  LoRa 868 MHz
+           ┌───────────┴────────────┐
+           │                        │
+  ┌────────▼────────┐     ┌─────────▼───────┐
+  │  TANK   0x02   │◄───►│  POND    0x03   │
+  │  (this device) │     │  remote pump    │
+  └─────────────────┘     └─────────────────┘
 ```
 
 | Node | Address | Role |
-|------|---------|------|
-| Gateway | 0x01 | Central coordinator |
-| Tank Controller | 0x02 | **This device** |
-| Pond Remote | 0x03 | Remote pump node |
+|------|:-------:|------|
+| Gateway | `0x01` | Central coordinator |
+| **Tank Controller** | **`0x02`** | **This device** |
+| Pond Remote | `0x03` | Remote pump node |
 
 ---
 
 ## Hardware
 
-**MCU:** ESP32 (Xtensa LX6 dual-core, Arduino + FreeRTOS)
-
-| Component | Part | Interface |
-|-----------|------|-----------|
-| LoRa Radio | SX1262 (E22) | SPI |
-| LED Strip | WS2812B × 10 | GPIO 12 |
-| Temp/Humidity | DHT22 | GPIO 16 |
-| Float Switches | × 4 | GPIO 34–39 |
-| Buttons | × 5 | GPIO 32, 33, 25, 21, 22 |
-| Relay Outputs | × 3 (P1–P3) | GPIO 13, 15, 2 |
-| Current Sensors | × 3 (ADC) | GPIO 4, 0, 3 |
-
-### GPIO Map
-
 ```
-SPI (LoRa):  NSS=5   DIO1=26  NRST=14  BUSY=27
-             SCK=18  MISO=19  MOSI=23
-
-Outputs:     Relay P1=13   Relay P2=15  Relay P3=2
-             LED Strip=12
-
-Inputs:      Button MODE=32  P1=33  P2=25  P3=21  POND=22
-             Float 1=34  Float 2=35  Float 3=36  Float 4=39
-             DHT22=16
-
-ADC:         Current P1=4   Current P2=0   Current P3=3
+┌──────────────────────────────────────────────────────────────┐
+│                        ESP32 DevKit                          │
+│                                                              │
+│  SPI (LoRa E22)          Outputs          Inputs            │
+│  ┌──────────────┐    ┌───────────────┐  ┌──────────────┐   │
+│  │ NSS    →  5  │    │ Relay P1 → 13 │  │ BTN MODE→32  │   │
+│  │ DIO1   → 26  │    │ Relay P2 → 15 │  │ BTN P1  →33  │   │
+│  │ NRST   → 14  │    │ Relay P3 → 17 │  │ BTN P2  →25  │   │
+│  │ BUSY   → 27  │    │ LED Strip→ 12 │  │ BTN P3  →21  │   │
+│  │ SCK    → 18  │    └───────────────┘  │ BTN POND→22  │   │
+│  │ MISO   → 19  │                       │ Float 0 →34  │   │
+│  │ MOSI   → 23  │    ADC (Current)      │ Float 1 →35  │   │
+│  └──────────────┘    ┌───────────────┐  │ Float 2 →36  │   │
+│                      │ Curr P1 →  4  │  └──────────────┘   │
+│                      │ Curr P2 → 39  │                      │
+│                      │ Curr P3 →  2  │                      │
+│                      └───────────────┘                      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-> **Hardware constraints:**
-> - GPIO 34–39 are input-only — require 10 kΩ pull-ups to 3.3 V
-> - GPIO 0 (Current P2 ADC) is a strapping pin — keep < 0.6 V at power-on
-> - GPIO 3 (Current P3 ADC) shares UART0-RX — disable `Serial` in production builds
+### Pin Summary
+
+| GPIO | Function | Type | Notes |
+|------|----------|------|-------|
+| 2 | Current P3 ADC | ADC2 input | Must be < 0.6 V at power-on (pump off = safe) |
+| 4 | Current P1 ADC | ADC2 input | |
+| 5 | LoRa NSS | SPI CS | |
+| 12 | WS2812B LED | Digital out | 10 LEDs |
+| 13 | Relay P1 | Digital out | |
+| 14 | LoRa NRST | Digital out | |
+| 15 | Relay P2 | Digital out | |
+| 17 | Relay P3 | Digital out | Safe output, no strapping concerns |
+| 18 | LoRa SCK | SPI | |
+| 19 | LoRa MISO | SPI | |
+| 21 | Button P3 | Input pullup | |
+| 22 | Button POND | Input pullup | |
+| 23 | LoRa MOSI | SPI | |
+| 25 | Button P2 | Input pullup | |
+| 26 | LoRa DIO1 | IRQ input | |
+| 27 | LoRa BUSY | Digital input | |
+| 32 | Button MODE | Input pullup | |
+| 33 | Button P1 | Input pullup | |
+| 34 | Float switch 0 | Input only | Needs 10 kOhm pull-up to 3.3 V |
+| 35 | Float switch 1 | Input only | Needs 10 kOhm pull-up to 3.3 V |
+| 36 | Float switch 2 | Input only | Needs 10 kOhm pull-up to 3.3 V |
+| 39 | Current P2 ADC | ADC1 input | Input only, safe |
+
+**Total: 21 GPIO used** — Freed vs previous: GPIO 0 (strapping), GPIO 3 (UART-RX/non-ADC), GPIO 16 (DHT22 removed)
+
+---
+
+## LED Status Strip (10 x WS2812B)
+
+```
+LED:  [ 0 ][ 1 ][ 2 ][ 3 ][ 4 ][ 5 ][ 6 ][ 7 ][ 8 ][ 9 ]
+       ─────────────── ──── ──── ──── ──── ──── ────
+       Water Level     Stat Mode  P1   P2   P3  Pond
+```
+
+### Water Level (LEDs 0-2)
+
+```
+  Empty  o o o      Level 0 — triggers pond pump in auto mode
+  Low    * o o      Level 1
+  Mid    * * o      Level 2
+  Full   * * *      Level 3 — stops pond pump in auto mode
+
+  * = AQUA  o = off
+```
+
+### Status LED (LED 4) — priority order
+
+```
+  RED   solid    Fault lockout (overcurrent or dry-run)
+  RED   flash    Comms error — gateway or pond timeout (400 ms)
+  PURPLE         LoRa packet received (200 ms flash)
+  CYAN           LoRa packet transmitted (200 ms flash)
+  YELLOW pulse   Awaiting ACK from pond node
+  GREEN          Auto mode — all OK
+  BLUE           Manual mode — all OK
+```
+
+### Mode and Pump LEDs (LEDs 5-9)
+
+| LED | GREEN / CYAN means | DIM means |
+|-----|-------------------|----------|
+| 5 | Auto mode (green) | Manual mode (blue) |
+| 6 | Pump P1 running | P1 off (dim red) |
+| 7 | Pump P2 running | P2 off (dim red) |
+| 8 | Pump P3 running | P3 off (dim red) |
+| 9 | Pond pump running (cyan) | Pond off (dim blue) |
 
 ---
 
 ## Features
 
-- **Auto mode** — monitors 4-level float switches and triggers pond pump with remote ACK handshake when tank is low
-- **Manual mode** — all pumps controlled by local buttons
-- **Pump hysteresis** — configurable minimum runtime and cooldown per pump
-- **Overcurrent protection** — immediate relay cutoff when ADC exceeds threshold
-- **Dry-run detection** — shuts down pump if no current draw is detected
-- **Replay attack prevention** — signed int8 sequence tracking per sender
-- **ACK handshake** — remote pond pump commands require LoRa acknowledgement with configurable retries
-- **Network health monitoring** — tracks last contact from gateway and pond node; sets error flag on timeout
-- **10-LED RGB feedback** — real-time water level, pump state, network status, and fault indication
-- **Runtime config over LoRa** — gateway can query and update all node settings without reflashing
-- **NVS persistence** — config, stats, and mode preference survive reboots
+```
+  Auto mode       Float switches trigger pond pump automatically
+  Manual mode     5 buttons control all pumps locally
+  Pump hysteresis Min runtime + cooldown enforced per pump
+  Overcurrent     Grace period filters inrush; warn or lockout (configurable)
+  Dry-run         Same grace period; warn or lockout (configurable)
+  ACK handshake   Pond commands confirmed with retry logic
+  Net monitoring  Tracks gateway + pond contact; flags timeout
+  LED feedback    10-LED strip shows full system state
+  LoRa config     Gateway can read/write all settings at runtime
+  NVS persist     Config, stats, mode survive reboots
+```
 
 ---
 
-## LoRa Packet Protocol (v1.1)
+## LoRa Packet Protocol v1.1
 
-### Packet Layout
+### Packet Layout (38 bytes total)
 
 ```
-Total: 38 bytes
-
-Header (6 bytes):
-  magic_word  [2B]  — 0x5A6B (network identifier)
-  target_id   [1B]  — destination node address
-  sender_id   [1B]  — source node address
-  msg_id      [1B]  — rolling message counter (replay protection)
-  msg_type    [1B]  — message type (see below)
-
-Payload union (32 bytes):
-  TelemetryData | CommandData | NodeConfig | StatsPayload
+ Byte  0    1    2         3         4       5        6 ... 37
+      +----+----+----------+---------+-------+--------+------------------+
+      |  magic (0x5A6B)   |target_id|send_id| msg_id | msg_type| payload |
+      +----+----+----------+---------+-------+--------+------------------+
+       <---------- Header: 6 bytes ---------->  <-- Payload union: 32 B -->
 ```
 
 ### Message Types
 
-| Type | Name | Direction | Description |
-|------|------|-----------|-------------|
-| 1 | `MSG_TELEMETRY` | Node → Gateway | Periodic sensor data |
-| 2 | `MSG_COMMAND` | Gateway → Node | Pump on/off command |
-| 3 | `MSG_ACK` | Node ↔ Node | Acknowledge receipt |
-| 4 | `MSG_CONFIG_GET` | Gateway → Node | Request current config |
-| 5 | `MSG_CONFIG_SET` | Gateway → Node | Write config to NVS |
-| 6 | `MSG_CONFIG_RESP` | Node → Gateway | Config response |
-| 7 | `MSG_STATS_GET` | Gateway → Node | Request operational stats |
-| 8 | `MSG_STATS_RESP` | Node → Gateway | Stats response |
+```
+  ID   Name              Direction          Description
+  ---  ----------------  -----------------  ------------------------------------
+   1   MSG_TELEMETRY     Node -> Gateway    Periodic sensor data
+   2   MSG_COMMAND       Gateway -> Node    Pump on/off command
+   3   MSG_ACK           Node <-> Node      Acknowledge receipt
+   4   MSG_CONFIG_GET    Gateway -> Node    Request current config
+   5   MSG_CONFIG_SET    Gateway -> Node    Write config to NVS
+   6   MSG_CONFIG_RESP   Node -> Gateway    Config echo (verify applied)
+   7   MSG_STATS_GET     Gateway -> Node    Request operational stats
+   8   MSG_STATS_RESP    Node -> Gateway    Pump runtimes, faults, etc.
+```
 
-### Telemetry Payload
+### Telemetry Payload (8 bytes)
 
 ```c
 struct TelemetryData {
-    uint8_t  water_level;    // 0–4 (float switch count)
-    uint8_t  system_flags;   // pump states, mode, fault
-    float    temperature;    // °C (DHT22)
-    float    humidity;       // % RH (DHT22)
-    uint8_t  error_code;     // 0=ok, 1=overcurrent, 2=dry-run, 3=comms
-    int16_t  rssi;           // last received packet RSSI
-    float    snr;            // last received packet SNR
+    uint8_t  water_level;   // 0-3  (3 float switches)
+    uint8_t  system_flags;  // bit0=Auto bit1=P1 bit2=P2 bit3=P3 bit4=Pond
+    int16_t  temperature;   // degrees C x10  (0 = DHT22 not fitted)
+    uint8_t  humidity;      // % RH            (0 = DHT22 not fitted)
+    uint8_t  error_code;    // 0=OK  1=Overcurrent  2=DryRun  3=Comms
+    int8_t   last_rssi;     // dBm of last received packet
+    int8_t   last_snr;      // SNR in dB
 };
 ```
 
 ### RF Configuration
 
-| Parameter | Value |
-|-----------|-------|
-| Frequency | 433.0 MHz |
-| Bandwidth | 125 kHz |
-| Spreading Factor | SF9 |
-| Coding Rate | 4/5 |
-| Sync Word | 0x12 |
-| TX Power | 22 dBm |
-| Preamble | 8 symbols |
-
-> At SF9/125 kHz a full 38-byte packet takes ~330 ms to transmit (RadioLib `transmit()` blocks).
+```
+  Frequency   868.0 MHz  (EU ISM band)
+  Bandwidth   125 kHz
+  SF          9  (minimum; raise to SF10/SF11 for more margin at range)
+  Coding rate 4/5
+  Sync word   0x12
+  TX power    22 dBm
+  Preamble    8 symbols
+  Airtime     ~330 ms for 38 bytes at SF9  (transmit() blocks the LoRa task)
+  Round-trip  ~700 ms CMD + ACK  →  ACK timeout default 10 s gives ample margin
+```
 
 ---
 
 ## Runtime Configuration
 
-All parameters are stored in NVS and can be updated at runtime via `MSG_CONFIG_SET`:
+All parameters live in NVS, tunable over LoRa via `MSG_CONFIG_SET` without reflashing:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pump_min_runtime_ms` | 30 000 | Minimum pump ON duration (ms) |
-| `pump_min_cooldown_ms` | 60 000 | Minimum OFF time before restart (ms) |
-| `replenish_runon_ms` | 300 000 | Minimum pond pump run for tank fill (ms) |
-| `telemetry_interval_ms` | 30 000 | Telemetry send period (ms) |
-| `network_timeout_ms` | 60 000 | No-contact timeout before comms error (ms) |
-| `ack_timeout_ms` | 5 000 | Wait for ACK before retry (ms) |
-| `overcurrent_thresh` | 3200 | 12-bit ADC raw cutoff (overcurrent) |
-| `dryrun_thresh` | 150 | 12-bit ADC raw floor (dry-run detection) |
-| `ack_max_retries` | 3 | Retries before marking comms failed |
-| `boot_auto_mode` | 1 | Startup mode: 1 = auto, 0 = manual |
+```
+  Parameter                    Default      Range                Description
+  ---------------------------  ----------   -------------------  --------------------------------
+  pump_min_runtime_ms             30 000    5 000 - 3 600 000   Min ON time per pump
+  pump_min_cooldown_ms            60 000    5 000 - 3 600 000   Min OFF before restart
+  replenish_runon_ms             300 000   30 000 - 86 400 000  Min pond pump run (fill)
+  telemetry_interval_ms           30 000    5 000 - 3 600 000   Telemetry send period
+  network_timeout_ms              60 000   10 000 - 3 600 000   Contact timeout -> error
+  ack_timeout_ms                  10 000    1 000 - 60 000       Wait for ACK before retry
+  overcurrent_thresh               3 200        0 - 4 095        ADC raw cutoff (12-bit)
+  dryrun_thresh                      150        0 - overcurrent  ADC raw floor
+  ack_max_retries                      5        1 - 10           Retries before comms error
+  boot_auto_mode                       1        0 or 1           Startup mode preference
+  overcurrent_grace_ticks              5        0 - 255          Ticks (×50 ms) before fault trips
+  fault_lockout_enabled                1        0 or 1           1=kill relays  0=warn only
+```
 
 ---
 
 ## Persistent Statistics
 
-Accumulated in NVS across reboots, readable via `MSG_STATS_GET`:
+Stored in NVS, survives reboots, queryable via `MSG_STATS_GET`:
 
-| Field | Description |
-|-------|-------------|
-| `runtime_p1_s` | Total P1 run time (seconds) |
-| `runtime_p2_s` | Total P2 run time (seconds) |
-| `runtime_p3_s` | Total P3 run time (seconds) |
-| `runtime_pond_s` | Total pond pump run time (seconds) |
-| `fill_cycles` | Number of tank refill cycles (leak indicator) |
-| `boot_count` | Total reboots |
-| `last_fault` | Most recent fault code (1=overcurrent, 2=dry-run) |
+```
+  runtime_p1_s     Pump P1 total ON time (seconds)
+  runtime_p2_s     Pump P2 total ON time (seconds)
+  runtime_p3_s     Pump P3 total ON time (seconds)
+  runtime_pond_s   Pond pump total ON time (seconds)
+  fill_cycles      Tank refill count  <-- high count = possible leak
+  boot_count       Total reboots
+  last_fault       1 = overcurrent  /  2 = dry-run
+```
 
 ---
 
 ## FreeRTOS Task Architecture
 
-| Task | Core | Priority | Period | Duties |
-|------|------|----------|--------|---------|
-| `InputSensorPoll` | 1 | 3 | 20 ms | Debounce float switches & buttons; ADC averaging (8 samples); DHT22 poll |
-| `ControlEngine` | 1 | 2 | 50 ms | State machine; pump hysteresis; drain RX queue; telemetry timer |
-| `LoRaTransceiver` | 0 | 4 | Event | Drain TX queue; handle RX ISR; validate/dispatch packets |
-| `UIAnimation` | 0 | 1 | 30 ms | LED updates: water level bar, pump indicators, network/fault status |
+```
+  Core 0                            Core 1
+  +----------------------+          +----------------------+
+  |  LoRaTransceiver     |          |  ControlEngine       |
+  |  Priority 2          |          |  Priority 4  50 ms   |
+  |  Event-driven        |          |  Relay/pump logic    |
+  |  TX queue drain      |          |  OC grace counter    |
+  |  RX ISR -> queue     |          |  ACK retry logic     |
+  +----------+-----------+          |  Telemetry timer     |
+             |  RX queue            +----------+-----------+
+  +----------v-----------+                     |  mutex
+  |  UIAnimation         |          +----------v-----------+
+  |  Priority 1  30 ms   |          |  InputSensorPoll     |
+  |  10-LED strip        |          |  Priority 3  20 ms   |
+  |  Level/pump/net/mode |          |  Float switches      |
+  +----------------------+          |  Buttons (debounce)  |
+                                    |  ADC current (x8)    |
+                                    +----------------------+
 
-**Synchronization:**
-- `SemaphoreHandle_t stateMutex` — guards `SystemState` struct
-- Binary semaphore — LoRa RX interrupt → `LoRaTransceiver` task
-- TX queue (depth 8) — other tasks → `LoRaTransceiver`
-- RX queue (depth 8) — `LoRaTransceiver` → `ControlEngine`
+  Priority rationale:
+    P4  ControlEngine   — relay decisions are most time-critical
+    P3  InputSensorPoll — must deliver fresh sensor data promptly
+    P2  LoRaTransceiver — comms important but not safety-critical
+    P1  UIAnimation     — display only; freely preemptable
+
+  Shared resources:
+    StateMutex          guards SystemState struct
+    LoRaIrqSemaphore    DIO1 ISR -> LoRaTransceiver task
+    TxQueue (depth 8)   any task -> LoRaTransceiver
+    RxQueue (depth 8)   LoRaTransceiver -> ControlEngine
+```
 
 ---
 
 ## Operating Modes
 
 ### Auto Mode
-1. `InputSensorPoll` reads 4 float switches → water level 0–4
-2. When level = 0, `ControlEngine` sends `MSG_COMMAND` (pump ON) to Pond node (0x03)
-3. Waits for `MSG_ACK`; retries up to `ack_max_retries` times
-4. Pond pump runs for at least `replenish_runon_ms`
-5. Stops when level = 4 AND minimum runtime elapsed AND ACK received from pond
-6. Mode preference persisted to NVS
+
+```
+  waterLevel == 0?
+    YES -> canTurnPumpOn?
+             YES -> Send CMD(pond ON) -> start replenish timer -> await ACK (retry x5, 10 s timeout)
+
+  waterLevel >= 3 AND runOn expired?
+    YES -> canTurnPumpOff?
+             YES -> Send CMD(pond OFF) -> await ACK
+```
 
 ### Manual Mode
-- Buttons toggle each pump independently
-- Same hysteresis, ACK, and fault logic applies
 
-### Fault Lockout
-- Triggered by overcurrent (`ADC > overcurrent_thresh`) or dry-run (`ADC < dryrun_thresh`)
-- All relays cut immediately; fault code written to NVS
-- Press **MODE button** to clear lockout
-- Error code 3 (comms) does **not** trigger lockout — pumps continue operating locally
+```
+  Button press -> toggle pump -> hysteresis check -> relay on/off
+                                                  -> LoRa CMD if pond pump
+```
+
+### Fault / Overcurrent
+
+```
+  Inrush grace:
+    ADC must exceed threshold for overcurrent_grace_ticks × 50 ms (default 250 ms)
+    before any action is taken — short inrush spikes are ignored.
+
+  fault_lockout_enabled = 1  (default):
+    ADC > overcurrent_thresh  ->  Kill all relays  ->  errorCode = 1  ->  save NVS
+    ADC < dryrun_thresh       ->  Kill all relays  ->  errorCode = 2  ->  save NVS
+    To clear: press MODE button
+
+  fault_lockout_enabled = 0  (warn-only):
+    Same conditions  ->  errorCode = 1 or 2  (LED shows fault colour)
+    Relays keep running; errorCode auto-clears when current returns to normal
+    Useful during commissioning or for systems with high inrush motors
+
+  Note: comms error (code 3) never triggers relay lockout in either mode
+```
 
 ---
 
 ## Building & Flashing
 
-### Prerequisites
-- [PlatformIO](https://platformio.org/) CLI or IDE extension
-
-### Dependencies (auto-managed)
+### Dependencies (PlatformIO, auto-managed)
 
 ```ini
-RadioLib          @ ^6.6.0
-FastLED           @ ^3.6.0
-Bounce2           @ ^2.71.0
-DHT sensor library @ ^1.4.6
-Adafruit Unified Sensor @ ^1.1.14
+lib_deps =
+    jgromes/RadioLib @ ^6.6.0
+    FastLED/FastLED @ ^3.6.0
+    thomasfredericks/Bounce2 @ ^2.71.0
 ```
 
 ### Commands
@@ -235,7 +336,7 @@ platformio run -e esp32dev
 # Flash
 platformio run -e esp32dev --target upload
 
-# Serial monitor (115200 baud)
+# Monitor (115200 baud)
 platformio device monitor -p /dev/ttyUSB0 -b 115200
 ```
 
@@ -254,24 +355,24 @@ platformio device monitor -p /dev/ttyUSB0 -b 115200
 
 ```
 esp32_e22/
-├── platformio.ini        # Build config (esp32dev, dependencies)
-└── src/
-    └── main.cpp          # Full firmware (~51 KB, 17 sections)
-        ├── §1  Pin definitions
-        ├── §2  Compile-time constants & RF settings
-        ├── §3  Packed network protocol structs
-        ├── §4  Global system state
-        ├── §5  FreeRTOS handles
-        ├── §6  Peripheral instances (SPI, Radio, LEDs, DHT, Bounce2)
-        ├── §7  Replay-attack sequence tracking
-        ├── §8  RadioLib DIO1 ISR
-        ├── §9  NVS load/save
-        ├── §10 Shared helpers (telemetry builder, pump commands, ACKs)
-        ├── §11 Pump hysteresis management
-        ├── §12 Task: InputSensorPoll
-        ├── §13 Task: ControlEngine
-        ├── §14 Task: LoRaTransceiver
-        ├── §15 Task: UIAnimation
-        ├── §16 setup()
-        └── §17 loop() — intentionally empty
++-- platformio.ini
++-- src/
+    +-- main.cpp          (~51 KB, 17 sections)
+        +-- S1   Pin definitions
+        +-- S2   Compile-time constants & RF settings
+        +-- S3   Packed network protocol structs
+        +-- S4   Global system state
+        +-- S5   FreeRTOS handles
+        +-- S6   Peripheral instances
+        +-- S7   Replay-attack sequence tracking
+        +-- S8   RadioLib DIO1 ISR
+        +-- S9   NVS load / save
+        +-- S10  Shared helpers (telemetry, ACK, commands)
+        +-- S11  Pump hysteresis management
+        +-- S12  Task: InputSensorPoll  (Core 1, P3, 20 ms)
+        +-- S13  Task: ControlEngine    (Core 1, P4, 50 ms)
+        +-- S14  Task: LoRaTransceiver  (Core 0, P2, event)
+        +-- S15  Task: UIAnimation      (Core 0, P1, 30 ms)
+        +-- S16  setup()
+        +-- S17  loop()  -- intentionally empty
 ```

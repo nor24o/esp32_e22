@@ -12,9 +12,10 @@
 //
 // HARDWARE NOTES:
 //   • GPIO 34-39: input-only, no internal pull-up.  Install 10 kΩ to 3.3 V.
-//   • GPIO 0  (CURRENT_P2_ADC): strapping pin — keep < 0.6 V at power-on.
-//   • GPIO 3  (CURRENT_P3_ADC): UART0-RX — disable Serial in production.
+//   • GPIO 2  (CURRENT_P3_ADC): strapping pin — sensor output must be < 0.6 V at power-on (pump off = safe).
+//   • GPIO 17 (RELAY_P3): safe digital output, no strapping concerns.
 //   • RadioLib transmit() blocks; at SF9/125 kHz max payload ≈ 330 ms.
+//   • DHT22 removed — temperature/humidity fields in telemetry will be zero.
 // =============================================================================
 
 #include <Arduino.h>
@@ -22,7 +23,6 @@
 #include <RadioLib.h>
 #include <FastLED.h>
 #include <Bounce2.h>
-#include <DHT.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -52,21 +52,18 @@
 #define BTN_P3    21
 #define BTN_POND  22
 
-#define FLOAT_0  34
-#define FLOAT_1  35
-#define FLOAT_2  36
-#define FLOAT_3  39
+#define FLOAT_0  34   // ADC1 – input-only, safe
+#define FLOAT_1  35   // ADC1 – input-only, safe
+#define FLOAT_2  36   // ADC1 – input-only, safe
+// 3 float switches → water level 0-3
 
 #define RELAY_P1  13
 #define RELAY_P2  15
-#define RELAY_P3  2
+#define RELAY_P3  17  // was GPIO 2 (strapping pin) → moved to safe GPIO 17
 
-#define CURRENT_P1_ADC  4
-#define CURRENT_P2_ADC  0
-#define CURRENT_P3_ADC  3
-
-#define DHT_PIN   16
-#define DHT_TYPE  DHT22
+#define CURRENT_P1_ADC  4   // ADC2_CH0
+#define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe (was GPIO 0, strapping pin)
+#define CURRENT_P3_ADC  2   // ADC2_CH2 – freed when relay moved to 17 (was GPIO 3, not ADC capable)
 
 // =============================================================================
 // SECTION 2 – COMPILE-TIME CONSTANTS AND DEFAULTS
@@ -74,7 +71,7 @@
 // =============================================================================
 
 // LoRa RF  (fixed – not runtime-configurable)
-#define LORA_FREQUENCY   433.0f
+#define LORA_FREQUENCY   868.0f
 #define LORA_BANDWIDTH   125.0f
 #define LORA_SF          9
 #define LORA_CR          5
@@ -91,7 +88,6 @@
 
 // Fixed operational constants (not user-tunable)
 #define ADC_SAMPLES           8
-#define DHT_READ_INTERVAL_MS  2000UL
 #define FLASH_RX_MS           200UL
 #define FLASH_TX_MS           200UL
 #define FLASH_NET_MS          400UL
@@ -100,19 +96,26 @@
 #define NVS_NAMESPACE    "tanknode"
 #define NVS_CFG_VER_KEY  "cfgver"
 #define NVS_CFG_KEY      "cfg"
-#define CONFIG_VERSION   1
+#define CONFIG_VERSION   2  // bumped: overcurrent_grace_ticks + fault_lockout_enabled added
 
 // Defaults for NodeConfig (applied on first boot or after version mismatch)
-#define DEF_PUMP_MIN_RUNTIME_MS     30000UL
-#define DEF_PUMP_MIN_COOLDOWN_MS    60000UL
-#define DEF_REPLENISH_RUNON_MS     300000UL
-#define DEF_TELEMETRY_INTERVAL_MS   30000UL
-#define DEF_NETWORK_TIMEOUT_MS      60000UL
-#define DEF_ACK_TIMEOUT_MS           5000UL
-#define DEF_ACK_MAX_RETRIES              3
-#define DEF_OVERCURRENT_THRESH        3200
-#define DEF_DRYRUN_THRESH              150
-#define DEF_BOOT_AUTO_MODE               1
+#define DEF_PUMP_MIN_RUNTIME_MS        30000UL
+#define DEF_PUMP_MIN_COOLDOWN_MS       60000UL
+#define DEF_REPLENISH_RUNON_MS        300000UL
+#define DEF_TELEMETRY_INTERVAL_MS      30000UL
+#define DEF_NETWORK_TIMEOUT_MS         60000UL
+#define DEF_ACK_TIMEOUT_MS            10000UL  // LoRa round-trip at 868/SF9 + margin
+#define DEF_ACK_MAX_RETRIES                5
+#define DEF_OVERCURRENT_THRESH          3200
+#define DEF_DRYRUN_THRESH                150
+#define DEF_BOOT_AUTO_MODE                 1
+#define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
+#define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
+
+// Capacitive touch button polarity
+// 1 = output LOW when touched (fell())  — most TTP223 modules with default pad
+// 0 = output HIGH when touched (rose()) — TTP223 with A-pad bridged
+#define CAP_BTN_ACTIVE_LOW  1
 
 // =============================================================================
 // SECTION 3 – PACKED NETWORK PROTOCOL STRUCTURES
@@ -138,7 +141,7 @@ struct __attribute__((packed)) LoRaHeader {
 };  // 6 bytes
 
 struct __attribute__((packed)) TelemetryData {
-    uint8_t  water_level;   // 0–4
+    uint8_t  water_level;   // 0–3  (3 float switches)
     uint8_t  system_flags;  // bit0=Auto bit1=P1 bit2=P2 bit3=P3 bit4=PondP
     int16_t  temperature;   // °C × 10
     uint8_t  humidity;      // % RH
@@ -160,12 +163,13 @@ struct __attribute__((packed)) NodeConfig {
     uint32_t replenish_runon_ms;     //  4   default 300 000
     uint32_t telemetry_interval_ms;  //  4   default 30 000
     uint32_t network_timeout_ms;     //  4   default 60 000
-    uint32_t ack_timeout_ms;         //  4   default 5 000
+    uint32_t ack_timeout_ms;         //  4   default 10 000
     uint16_t overcurrent_thresh;     //  2   default 3200 (12-bit ADC raw)
     uint16_t dryrun_thresh;          //  2   default 150
-    uint8_t  ack_max_retries;        //  1   default 3
-    uint8_t  boot_auto_mode;         //  1   1=auto 0=manual
-    uint8_t  reserved[2];            //  2
+    uint8_t  ack_max_retries;          //  1   default 5
+    uint8_t  boot_auto_mode;           //  1   1=auto 0=manual
+    uint8_t  overcurrent_grace_ticks;  //  1   consecutive 50ms ticks before fault trips (0=immediate)
+    uint8_t  fault_lockout_enabled;    //  1   1=kill relays + lockout  0=warn only (no relay cut)
 };  // 32 bytes
 
 // Operational statistics — persisted in NVS, queryable over LoRa
@@ -237,8 +241,7 @@ static QueueHandle_t     xRxQueue          = nullptr;
 static SPIClass loraSPI(VSPI);
 static SX1262   radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, loraSPI);
 static CRGB     leds[NUM_LEDS];
-static DHT      dht(DHT_PIN, DHT_TYPE);
-static Bounce   floatSwitch[4];
+static Bounce   floatSwitch[3];
 static Bounce   btn[5];
 
 // =============================================================================
@@ -301,9 +304,10 @@ static void resetConfigToDefaults() {
     gConfig.ack_timeout_ms        = DEF_ACK_TIMEOUT_MS;
     gConfig.overcurrent_thresh    = DEF_OVERCURRENT_THRESH;
     gConfig.dryrun_thresh         = DEF_DRYRUN_THRESH;
-    gConfig.ack_max_retries       = DEF_ACK_MAX_RETRIES;
-    gConfig.boot_auto_mode        = DEF_BOOT_AUTO_MODE;
-    memset(gConfig.reserved, 0, sizeof(gConfig.reserved));
+    gConfig.ack_max_retries          = DEF_ACK_MAX_RETRIES;
+    gConfig.boot_auto_mode           = DEF_BOOT_AUTO_MODE;
+    gConfig.overcurrent_grace_ticks  = DEF_OVERCURRENT_GRACE_TICKS;
+    gConfig.fault_lockout_enabled    = DEF_FAULT_LOCKOUT_ENABLED;
 }
 
 // Sanity-check incoming config before applying it.
@@ -513,33 +517,29 @@ static inline uint32_t trackPumpOff(uint32_t &onSince) {
 // =============================================================================
 
 static void Task_InputSensorPoll(void *pvParams) {
-    const uint8_t floatPins[4] = { FLOAT_0, FLOAT_1, FLOAT_2, FLOAT_3 };
+    const uint8_t floatPins[3] = { FLOAT_0, FLOAT_1, FLOAT_2 };
     const uint8_t btnPins[5]   = { BTN_MODE, BTN_P1, BTN_P2, BTN_P3, BTN_POND };
     const uint8_t curPins[3]   = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
 
-    for (uint8_t i = 0; i < 4; i++) {
+    for (uint8_t i = 0; i < 3; i++) {
         floatSwitch[i].attach(floatPins[i], INPUT);
         floatSwitch[i].interval(2000);
     }
     for (uint8_t i = 0; i < 5; i++) {
-        btn[i].attach(btnPins[i], INPUT_PULLUP);
-        btn[i].interval(25);
+        btn[i].attach(btnPins[i], INPUT);  // cap module drives line actively
+        btn[i].interval(15);               // no mechanical bounce; 15 ms filters cap noise
     }
-
-    uint32_t dhtLastRead_ms = 0;
-    float    lastTemp       = 0.0f;
-    float    lastHumid      = 0.0f;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
 
-        for (uint8_t i = 0; i < 4; i++) floatSwitch[i].update();
+        for (uint8_t i = 0; i < 3; i++) floatSwitch[i].update();
         for (uint8_t i = 0; i < 5; i++) btn[i].update();
 
         uint8_t level = 0;
-        for (uint8_t i = 0; i < 4; i++) {
+        for (uint8_t i = 0; i < 3; i++) {
             if (floatSwitch[i].read() == LOW) level = (uint8_t)(i + 1);
             else break;
         }
@@ -547,24 +547,15 @@ static void Task_InputSensorPoll(void *pvParams) {
         uint16_t cur[3];
         for (uint8_t i = 0; i < 3; i++) cur[i] = readCurrentADC(curPins[i]);
 
-        uint32_t now = millis();
-        if ((now - dhtLastRead_ms) >= DHT_READ_INTERVAL_MS) {
-            dhtLastRead_ms = now;
-            float t = dht.readTemperature();
-            float h = dht.readHumidity();
-            if (!isnan(t) && !isnan(h)) { lastTemp = t; lastHumid = h; }
-        }
-
         bool edges[5];
-        for (uint8_t i = 0; i < 5; i++) edges[i] = btn[i].fell();
+        for (uint8_t i = 0; i < 5; i++)
+            edges[i] = CAP_BTN_ACTIVE_LOW ? btn[i].fell() : btn[i].rose();
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            gState.waterLevel  = level;
-            gState.currentP1   = cur[0];
-            gState.currentP2   = cur[1];
-            gState.currentP3   = cur[2];
-            gState.temperature = lastTemp;
-            gState.humidity    = lastHumid;
+            gState.waterLevel = level;
+            gState.currentP1  = cur[0];
+            gState.currentP2  = cur[1];
+            gState.currentP3  = cur[2];
             if (edges[0]) gState.btnMode_edge = true;
             if (edges[1]) gState.btnP1_edge   = true;
             if (edges[2]) gState.btnP2_edge   = true;
@@ -576,7 +567,7 @@ static void Task_InputSensorPoll(void *pvParams) {
 }
 
 // =============================================================================
-// SECTION 13 – TASK: CONTROL ENGINE  (Priority 2, Core 1, 50 ms)
+// SECTION 13 – TASK: CONTROL ENGINE  (Priority 4, Core 1, 50 ms)
 // =============================================================================
 
 static void Task_ControlEngine(void *pvParams) {
@@ -590,6 +581,9 @@ static void Task_ControlEngine(void *pvParams) {
     uint32_t onSince_p2   = 0;
     uint32_t onSince_p3   = 0;
     uint32_t onSince_pond = 0;
+
+    uint8_t  ocGrace[3] = {0, 0, 0};   // consecutive overcurrent ticks per pump (P1/P2/P3)
+    uint8_t  drGrace[3] = {0, 0, 0};   // consecutive dry-run ticks per pump
 
     bool     replenishActive    = false;
     uint32_t replenishStartTime = 0;
@@ -634,38 +628,64 @@ static void Task_ControlEngine(void *pvParams) {
 
         xSemaphoreGive(xStateMutex);
 
-        // ── Overcurrent / dry-run protection ─────────────────────────────────
-        bool overCurrent = (ph_p1.state && curP1 > gConfig.overcurrent_thresh) ||
-                           (ph_p2.state && curP2 > gConfig.overcurrent_thresh) ||
-                           (ph_p3.state && curP3 > gConfig.overcurrent_thresh);
+        // ── Overcurrent / dry-run protection (inrush grace period) ───────────────
+        // Grace counters accumulate consecutive 50 ms ticks above/below threshold.
+        // A fault only triggers after overcurrent_grace_ticks consecutive detections
+        // (default 5 = 250 ms), filtering inrush spikes.  When fault_lockout_enabled=0
+        // the relays keep running and errorCode is a warning only; it auto-clears.
+        {
+            const uint16_t curArr[3]  = { curP1, curP2, curP3 };
+            const bool     runArr[3]  = { ph_p1.state, ph_p2.state, ph_p3.state };
+            bool overCurrent = false, dryRun = false;
 
-        bool dryRun = (ph_p1.state && curP1 < gConfig.dryrun_thresh) ||
-                      (ph_p2.state && curP2 < gConfig.dryrun_thresh) ||
-                      (ph_p3.state && curP3 < gConfig.dryrun_thresh);
-
-        if (overCurrent || dryRun) {
-            // Immediate kill – bypass hysteresis
-            digitalWrite(RELAY_P1, LOW); gStats.runtime_p1_s += trackPumpOff(onSince_p1);
-            digitalWrite(RELAY_P2, LOW); gStats.runtime_p2_s += trackPumpOff(onSince_p2);
-            digitalWrite(RELAY_P3, LOW); gStats.runtime_p3_s += trackPumpOff(onSince_p3);
-            ph_p1.state = false; ph_p1.lastOffTime_ms = now;
-            ph_p2.state = false; ph_p2.lastOffTime_ms = now;
-            ph_p3.state = false; ph_p3.lastOffTime_ms = now;
-
-            uint8_t faultCode = overCurrent ? 1 : 2;
-            gStats.last_fault = faultCode;
-            saveStats();  // persist fault code and accumulated run-times
-
-            if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                gState.relay_p1     = false;
-                gState.relay_p2     = false;
-                gState.relay_p3     = false;
-                gState.errorCode    = faultCode;
-                gState.faultLockout = true;
-                xSemaphoreGive(xStateMutex);
+            for (uint8_t i = 0; i < 3; i++) {
+                if (runArr[i]) {
+                    if (curArr[i] > gConfig.overcurrent_thresh) {
+                        if (ocGrace[i] < 255) ocGrace[i]++;
+                    } else { ocGrace[i] = 0; }
+                    if (curArr[i] < gConfig.dryrun_thresh) {
+                        if (drGrace[i] < 255) drGrace[i]++;
+                    } else { drGrace[i] = 0; }
+                    if (ocGrace[i] >= gConfig.overcurrent_grace_ticks) overCurrent = true;
+                    if (drGrace[i] >= gConfig.overcurrent_grace_ticks) dryRun      = true;
+                } else {
+                    ocGrace[i] = drGrace[i] = 0;
+                }
             }
-            buildAndQueueTelemetry();
-            continue;
+
+            if (overCurrent || dryRun) {
+                uint8_t faultCode = overCurrent ? 1 : 2;
+                if (gConfig.fault_lockout_enabled) {
+                    // Hard trip – kill relays immediately, bypass hysteresis
+                    digitalWrite(RELAY_P1, LOW); gStats.runtime_p1_s += trackPumpOff(onSince_p1);
+                    digitalWrite(RELAY_P2, LOW); gStats.runtime_p2_s += trackPumpOff(onSince_p2);
+                    digitalWrite(RELAY_P3, LOW); gStats.runtime_p3_s += trackPumpOff(onSince_p3);
+                    ph_p1.state = false; ph_p1.lastOffTime_ms = now;
+                    ph_p2.state = false; ph_p2.lastOffTime_ms = now;
+                    ph_p3.state = false; ph_p3.lastOffTime_ms = now;
+                    gStats.last_fault = faultCode;
+                    saveStats();
+                    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        gState.relay_p1 = false; gState.relay_p2 = false; gState.relay_p3 = false;
+                        gState.faultLockout = true;
+                        xSemaphoreGive(xStateMutex);
+                    }
+                }
+                // Always set errorCode (warning or lockout)
+                if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    gState.errorCode = faultCode;
+                    xSemaphoreGive(xStateMutex);
+                }
+                buildAndQueueTelemetry();
+                if (gConfig.fault_lockout_enabled) continue;  // halt remaining logic if locked out
+
+            } else if (!faultLockout) {
+                // Auto-clear warning once current returns to normal
+                if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    if (gState.errorCode == 1 || gState.errorCode == 2) gState.errorCode = 0;
+                    xSemaphoreGive(xStateMutex);
+                }
+            }
         }
 
         // ── Fault-lockout gate ────────────────────────────────────────────────
@@ -862,7 +882,7 @@ static void Task_ControlEngine(void *pvParams) {
                 }
             } else if (replenishActive) {
                 bool runOnExpired = (now - replenishStartTime) >= gConfig.replenish_runon_ms;
-                if (runOnExpired && waterLevel >= 4 && canTurnPumpOff(ph_pond)) {
+                if (runOnExpired && waterLevel >= 3 && canTurnPumpOff(ph_pond)) {
                     replenishActive = false;
                     gStats.runtime_pond_s += trackPumpOff(onSince_pond);
                     setPumpState(ph_pond, false, -1);
@@ -969,7 +989,7 @@ static void Task_ControlEngine(void *pvParams) {
 }
 
 // =============================================================================
-// SECTION 14 – TASK: LORA TRANSCEIVER  (Priority 4, Core 0, Event-driven)
+// SECTION 14 – TASK: LORA TRANSCEIVER  (Priority 2, Core 0, Event-driven)
 // =============================================================================
 
 static void Task_LoRaTransceiver(void *pvParams) {
@@ -1076,8 +1096,8 @@ static void Task_UIAnimation(void *pvParams) {
 
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // LEDs 0-3: water level (aqua fill from bottom)
-        for (uint8_t i = 0; i < waterLevel && i < 4; i++) leds[i] = CRGB(0, 180, 220);
+        // LEDs 0-2: water level (aqua fill from bottom, 3 float switches -> level 0-3)
+        for (uint8_t i = 0; i < waterLevel && i < 3; i++) leds[i] = CRGB(0, 180, 220);
 
         // LED 4: system status (priority order)
         if (faultLockout || errorCode == 1 || errorCode == 2) {
@@ -1091,7 +1111,7 @@ static void Task_UIAnimation(void *pvParams) {
             leds[4] = netFlashOn ? CRGB::Red : CRGB::Black;
 
         } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
-            leds[4] = CRGB(148, 0, 211);   // purple – RX
+            leds[4] = CRGB(148, 0, 211);   // purple - RX
 
         } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
             leds[4] = CRGB::Cyan;           // TX
@@ -1160,9 +1180,6 @@ void setup() {
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
 
-    // ── DHT22 ─────────────────────────────────────────────────────────────────
-    dht.begin();
-
     // ── Global state ──────────────────────────────────────────────────────────
     memset(&gState, 0, sizeof(gState));
     gState.autoMode              = (gConfig.boot_auto_mode != 0);
@@ -1211,13 +1228,16 @@ void setup() {
     // ── FreeRTOS tasks ────────────────────────────────────────────────────────
     BaseType_t rc;
 
+    // Priority scheme: pump control is most critical, LoRa is secondary.
+    // Core 1: InputSensorPoll P3 feeds ControlEngine P4 (pump logic is king)
+    // Core 0: LoRaTransceiver P2, UIAnimation P1
     rc = xTaskCreatePinnedToCore(Task_InputSensorPoll, "InputPoll", 4096, nullptr, 3, nullptr, 1);
     configASSERT(rc == pdPASS);
 
-    rc = xTaskCreatePinnedToCore(Task_ControlEngine,   "CtrlEng",  8192, nullptr, 2, nullptr, 1);
+    rc = xTaskCreatePinnedToCore(Task_ControlEngine,   "CtrlEng",  8192, nullptr, 4, nullptr, 1);
     configASSERT(rc == pdPASS);
 
-    rc = xTaskCreatePinnedToCore(Task_LoRaTransceiver, "LoRaTx",   8192, nullptr, 4, nullptr, 0);
+    rc = xTaskCreatePinnedToCore(Task_LoRaTransceiver, "LoRaTx",   8192, nullptr, 2, nullptr, 0);
     configASSERT(rc == pdPASS);
 
     rc = xTaskCreatePinnedToCore(Task_UIAnimation,     "UIAnim",   4096, nullptr, 1, nullptr, 0);
