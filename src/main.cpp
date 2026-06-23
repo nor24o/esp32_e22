@@ -12,9 +12,10 @@
 //
 // HARDWARE NOTES:
 //   • GPIO 34-39: input-only, no internal pull-up.  Install 10 kΩ to 3.3 V.
-//   • GPIO 0  (CURRENT_P2_ADC): strapping pin — keep < 0.6 V at power-on.
-//   • GPIO 3  (CURRENT_P3_ADC): UART0-RX — disable Serial in production.
+//   • GPIO 2  (CURRENT_P3_ADC): strapping pin — sensor output must be < 0.6 V at power-on (pump off = safe).
+//   • GPIO 17 (RELAY_P3): safe digital output, no strapping concerns.
 //   • RadioLib transmit() blocks; at SF9/125 kHz max payload ≈ 330 ms.
+//   • DHT22 removed — temperature/humidity fields in telemetry will be zero.
 // =============================================================================
 
 #include <Arduino.h>
@@ -22,7 +23,6 @@
 #include <RadioLib.h>
 #include <FastLED.h>
 #include <Bounce2.h>
-#include <DHT.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -52,21 +52,18 @@
 #define BTN_P3    21
 #define BTN_POND  22
 
-#define FLOAT_0  34
-#define FLOAT_1  35
-#define FLOAT_2  36
-#define FLOAT_3  39
+#define FLOAT_0  34   // ADC1 – input-only, safe
+#define FLOAT_1  35   // ADC1 – input-only, safe
+#define FLOAT_2  36   // ADC1 – input-only, safe
+// 3 float switches → water level 0-3
 
 #define RELAY_P1  13
 #define RELAY_P2  15
-#define RELAY_P3  2
+#define RELAY_P3  17  // was GPIO 2 (strapping pin) → moved to safe GPIO 17
 
-#define CURRENT_P1_ADC  4
-#define CURRENT_P2_ADC  0
-#define CURRENT_P3_ADC  3
-
-#define DHT_PIN   16
-#define DHT_TYPE  DHT22
+#define CURRENT_P1_ADC  4   // ADC2_CH0
+#define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe (was GPIO 0, strapping pin)
+#define CURRENT_P3_ADC  2   // ADC2_CH2 – freed when relay moved to 17 (was GPIO 3, not ADC capable)
 
 // =============================================================================
 // SECTION 2 – COMPILE-TIME CONSTANTS AND DEFAULTS
@@ -91,7 +88,6 @@
 
 // Fixed operational constants (not user-tunable)
 #define ADC_SAMPLES           8
-#define DHT_READ_INTERVAL_MS  2000UL
 #define FLASH_RX_MS           200UL
 #define FLASH_TX_MS           200UL
 #define FLASH_NET_MS          400UL
@@ -138,10 +134,10 @@ struct __attribute__((packed)) LoRaHeader {
 };  // 6 bytes
 
 struct __attribute__((packed)) TelemetryData {
-    uint8_t  water_level;   // 0–4
+    uint8_t  water_level;   // 0–3
     uint8_t  system_flags;  // bit0=Auto bit1=P1 bit2=P2 bit3=P3 bit4=PondP
-    int16_t  temperature;   // °C × 10
-    uint8_t  humidity;      // % RH
+    int16_t  temperature;   // °C × 10  (0 = DHT22 not fitted)
+    uint8_t  humidity;      // % RH     (0 = DHT22 not fitted)
     uint8_t  error_code;    // 0=OK 1=OC 2=DryRun 3=Comms
     int8_t   last_rssi;     // dBm of last received packet
     int8_t   last_snr;      // SNR in dB
@@ -237,8 +233,7 @@ static QueueHandle_t     xRxQueue          = nullptr;
 static SPIClass loraSPI(VSPI);
 static SX1262   radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, loraSPI);
 static CRGB     leds[NUM_LEDS];
-static DHT      dht(DHT_PIN, DHT_TYPE);
-static Bounce   floatSwitch[4];
+static Bounce   floatSwitch[3];
 static Bounce   btn[5];
 
 // =============================================================================
@@ -513,11 +508,11 @@ static inline uint32_t trackPumpOff(uint32_t &onSince) {
 // =============================================================================
 
 static void Task_InputSensorPoll(void *pvParams) {
-    const uint8_t floatPins[4] = { FLOAT_0, FLOAT_1, FLOAT_2, FLOAT_3 };
+    const uint8_t floatPins[3] = { FLOAT_0, FLOAT_1, FLOAT_2 };
     const uint8_t btnPins[5]   = { BTN_MODE, BTN_P1, BTN_P2, BTN_P3, BTN_POND };
     const uint8_t curPins[3]   = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
 
-    for (uint8_t i = 0; i < 4; i++) {
+    for (uint8_t i = 0; i < 3; i++) {
         floatSwitch[i].attach(floatPins[i], INPUT);
         floatSwitch[i].interval(2000);
     }
@@ -526,20 +521,16 @@ static void Task_InputSensorPoll(void *pvParams) {
         btn[i].interval(25);
     }
 
-    uint32_t dhtLastRead_ms = 0;
-    float    lastTemp       = 0.0f;
-    float    lastHumid      = 0.0f;
-
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
 
-        for (uint8_t i = 0; i < 4; i++) floatSwitch[i].update();
+        for (uint8_t i = 0; i < 3; i++) floatSwitch[i].update();
         for (uint8_t i = 0; i < 5; i++) btn[i].update();
 
         uint8_t level = 0;
-        for (uint8_t i = 0; i < 4; i++) {
+        for (uint8_t i = 0; i < 3; i++) {
             if (floatSwitch[i].read() == LOW) level = (uint8_t)(i + 1);
             else break;
         }
@@ -547,24 +538,14 @@ static void Task_InputSensorPoll(void *pvParams) {
         uint16_t cur[3];
         for (uint8_t i = 0; i < 3; i++) cur[i] = readCurrentADC(curPins[i]);
 
-        uint32_t now = millis();
-        if ((now - dhtLastRead_ms) >= DHT_READ_INTERVAL_MS) {
-            dhtLastRead_ms = now;
-            float t = dht.readTemperature();
-            float h = dht.readHumidity();
-            if (!isnan(t) && !isnan(h)) { lastTemp = t; lastHumid = h; }
-        }
-
         bool edges[5];
         for (uint8_t i = 0; i < 5; i++) edges[i] = btn[i].fell();
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            gState.waterLevel  = level;
-            gState.currentP1   = cur[0];
-            gState.currentP2   = cur[1];
-            gState.currentP3   = cur[2];
-            gState.temperature = lastTemp;
-            gState.humidity    = lastHumid;
+            gState.waterLevel = level;
+            gState.currentP1  = cur[0];
+            gState.currentP2  = cur[1];
+            gState.currentP3  = cur[2];
             if (edges[0]) gState.btnMode_edge = true;
             if (edges[1]) gState.btnP1_edge   = true;
             if (edges[2]) gState.btnP2_edge   = true;
@@ -862,7 +843,7 @@ static void Task_ControlEngine(void *pvParams) {
                 }
             } else if (replenishActive) {
                 bool runOnExpired = (now - replenishStartTime) >= gConfig.replenish_runon_ms;
-                if (runOnExpired && waterLevel >= 4 && canTurnPumpOff(ph_pond)) {
+                if (runOnExpired && waterLevel >= 3 && canTurnPumpOff(ph_pond)) {
                     replenishActive = false;
                     gStats.runtime_pond_s += trackPumpOff(onSince_pond);
                     setPumpState(ph_pond, false, -1);
@@ -1076,8 +1057,8 @@ static void Task_UIAnimation(void *pvParams) {
 
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // LEDs 0-3: water level (aqua fill from bottom)
-        for (uint8_t i = 0; i < waterLevel && i < 4; i++) leds[i] = CRGB(0, 180, 220);
+        // LEDs 0-2: water level (aqua fill from bottom, 3 float switches -> level 0-3)
+        for (uint8_t i = 0; i < waterLevel && i < 3; i++) leds[i] = CRGB(0, 180, 220);
 
         // LED 4: system status (priority order)
         if (faultLockout || errorCode == 1 || errorCode == 2) {
@@ -1159,9 +1140,6 @@ void setup() {
     FastLED.setBrightness(80);
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
-
-    // ── DHT22 ─────────────────────────────────────────────────────────────────
-    dht.begin();
 
     // ── Global state ──────────────────────────────────────────────────────────
     memset(&gState, 0, sizeof(gState));
