@@ -112,6 +112,11 @@
 #define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
 #define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
 
+// Capacitive touch button polarity
+// 1 = output LOW when touched (fell())  — most TTP223 modules with default pad
+// 0 = output HIGH when touched (rose()) — TTP223 with A-pad bridged
+#define CAP_BTN_ACTIVE_LOW  1
+
 // =============================================================================
 // SECTION 3 – PACKED NETWORK PROTOCOL STRUCTURES
 // =============================================================================
@@ -521,8 +526,8 @@ static void Task_InputSensorPoll(void *pvParams) {
         floatSwitch[i].interval(2000);
     }
     for (uint8_t i = 0; i < 5; i++) {
-        btn[i].attach(btnPins[i], INPUT_PULLUP);
-        btn[i].interval(25);
+        btn[i].attach(btnPins[i], INPUT);  // cap module drives line actively
+        btn[i].interval(15);               // no mechanical bounce; 15 ms filters cap noise
     }
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -543,7 +548,8 @@ static void Task_InputSensorPoll(void *pvParams) {
         for (uint8_t i = 0; i < 3; i++) cur[i] = readCurrentADC(curPins[i]);
 
         bool edges[5];
-        for (uint8_t i = 0; i < 5; i++) edges[i] = btn[i].fell();
+        for (uint8_t i = 0; i < 5; i++)
+            edges[i] = CAP_BTN_ACTIVE_LOW ? btn[i].fell() : btn[i].rose();
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             gState.waterLevel = level;
