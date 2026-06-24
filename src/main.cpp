@@ -2,7 +2,7 @@
 // TANK CONTROLLER NODE (0x02)  –  Production Firmware v1.1
 // Target  : Espressif ESP32 (Xtensa LX6 Dual-Core)
 // Framework: Arduino + FreeRTOS
-// Libraries: RadioLib (SX1262), FastLED (WS2812B), Bounce2, DHT22, Preferences
+// Libraries: RadioLib (SX1262), FastLED (WS2812B), Wire/PCF8574, Preferences
 //
 // Protocol v1.1 vs v1.0:
 //   • TelemetryData gains last_rssi (int8) and last_snr (int8) — wire-breaking change
@@ -12,8 +12,9 @@
 //
 // HARDWARE NOTES:
 //   • GPIO 34-39: input-only, no internal pull-up.  Install 10 kΩ to 3.3 V.
-//   • GPIO 2  (CURRENT_P3_ADC): strapping pin — sensor output must be < 0.6 V at power-on (pump off = safe).
-//   • GPIO 17 (RELAY_P3): safe digital output, no strapping concerns.
+//   • GPIO 2  (I2C_SCL): used for PCF8574. CURRENT_P3_ADC moved to GPIO 3 on S3.
+//   • Relays P1/P2/P3: GPIO 47/41/39 (active-low). Buzzer: GPIO 21 (active-low).
+//   • WS2812B: GPIO 40. LoRa MISO: GPIO 13 (S3), 19 (ESP32). BUSY: GPIO 17 (S3), 27 (ESP32).
 //   • RadioLib transmit() blocks; at SF9/125 kHz max payload ≈ 330 ms.
 //   • DHT22 removed — temperature/humidity fields in telemetry will be zero.
 // =============================================================================
@@ -22,12 +23,13 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include <FastLED.h>
-#include <Bounce2.h>
+#include <Wire.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <esp_system.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -36,34 +38,56 @@
 // =============================================================================
 
 #define LORA_NSS   5
-#define LORA_DIO1  26
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+  #define LORA_DIO1  16
+  #define LORA_BUSY  17
+  #define LORA_MOSI  11
+  #define LORA_MISO  13
+#else
+  #define LORA_DIO1  26
+  #define LORA_BUSY  27
+  #define LORA_MOSI  23
+  #define LORA_MISO  19
+#endif
 #define LORA_NRST  14
-#define LORA_BUSY  27
 #define LORA_SCK   18
-#define LORA_MISO  19
-#define LORA_MOSI  23
 
-#define WS2812B_PIN  12
+#define WS2812B_PIN  48
 #define NUM_LEDS     10
 
-#define BTN_MODE  32
-#define BTN_P1    33
-#define BTN_P2    25
-#define BTN_P3    21
-#define BTN_POND  22
+// I2C bus for PCF8574 I/O expander (float switches + buttons)
+#define I2C_SDA  1
+#define I2C_SCL  2
 
-#define FLOAT_0  34   // ADC1 – input-only, safe
-#define FLOAT_1  35   // ADC1 – input-only, safe
-#define FLOAT_2  36   // ADC1 – input-only, safe
-// 3 float switches → water level 0-3
+// PCF8574 address and bit assignments (8-bit, all inputs, active-low with pull-ups)
+#define PCF8574_ADDR  0x27
+#define PCF_FLOAT_0   0
+#define PCF_FLOAT_1   1
+#define PCF_FLOAT_2   2
+#define PCF_BTN_MODE  3
+#define PCF_BTN_P1    4
+#define PCF_BTN_P2    5
+#define PCF_BTN_P3    6
+#define PCF_BTN_POND  7
 
-#define RELAY_P1  13
-#define RELAY_P2  15
-#define RELAY_P3  17  // was GPIO 2 (strapping pin) → moved to safe GPIO 17
+// Relay and buzzer outputs (native GPIO, active-low: LOW=ON, HIGH=OFF)
+#define RELAY_P1    47
+#define RELAY_P2    41
+#define RELAY_P3    39
+#define BUZZER_PIN  21
 
-#define CURRENT_P1_ADC  4   // ADC2_CH0
-#define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe (was GPIO 0, strapping pin)
-#define CURRENT_P3_ADC  2   // ADC2_CH2 – freed when relay moved to 17 (was GPIO 3, not ADC capable)
+#define CURRENT_P1_ADC  4   // ADC1_CH3 on S3 / ADC2_CH0 on ESP32
+// GPIO 39 is not ADC-capable on ESP32-S3; ADC1 is GPIO 1-10, ADC2 is GPIO 11-20
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+  #define CURRENT_P2_ADC   7  // ADC1_CH6 on S3
+#else
+  #define CURRENT_P2_ADC  39  // ADC1_CH3 on classic ESP32 (input-only, safe)
+#endif
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+  #define CURRENT_P3_ADC  3  // ADC1_CH2 on S3 (GPIO 2 reserved for I2C_SCL)
+#else
+  #define CURRENT_P3_ADC  2  // ADC2_CH2 on classic ESP32
+#endif
 
 // =============================================================================
 // SECTION 2 – COMPILE-TIME CONSTANTS AND DEFAULTS
@@ -98,6 +122,11 @@
 #define NVS_CFG_KEY      "cfg"
 #define CONFIG_VERSION   2  // bumped: overcurrent_grace_ticks + fault_lockout_enabled added
 
+// Consecutive abnormal-reset counter stored in NVS.
+// If radio init crashes (INT_WDT/Panic) repeatedly we skip init to break the loop.
+#define NVS_RADIO_STREAK_KEY  "radio_cs"
+#define RADIO_SKIP_STREAK     3   // skip radio after this many consecutive crash-boots during init
+
 // Defaults for NodeConfig (applied on first boot or after version mismatch)
 #define DEF_PUMP_MIN_RUNTIME_MS        30000UL
 #define DEF_PUMP_MIN_COOLDOWN_MS       60000UL
@@ -111,11 +140,6 @@
 #define DEF_BOOT_AUTO_MODE                 1
 #define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
 #define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
-
-// Capacitive touch button polarity
-// 1 = output LOW when touched (fell())  — most TTP223 modules with default pad
-// 0 = output HIGH when touched (rose()) — TTP223 with A-pad bridged
-#define CAP_BTN_ACTIVE_LOW  1
 
 // =============================================================================
 // SECTION 3 – PACKED NETWORK PROTOCOL STRUCTURES
@@ -224,6 +248,8 @@ struct SystemState {
 };
 
 static SystemState gState;
+static bool        gRadioOk = false;  // set true only after successful radio.begin()+startReceive()
+static bool        gPcfOk   = false;  // set true only after PCF8574 ACKs its address in setup()
 
 // =============================================================================
 // SECTION 5 – FREERTOS SYNCHRONISATION HANDLES
@@ -231,6 +257,7 @@ static SystemState gState;
 
 static SemaphoreHandle_t xStateMutex       = nullptr;
 static SemaphoreHandle_t xLoRaIrqSemaphore = nullptr;
+static SemaphoreHandle_t xI2cMutex         = nullptr;  // guards Wire bus in Task_InputSensorPoll
 static QueueHandle_t     xTxQueue          = nullptr;
 static QueueHandle_t     xRxQueue          = nullptr;
 
@@ -238,11 +265,13 @@ static QueueHandle_t     xRxQueue          = nullptr;
 // SECTION 6 – PERIPHERAL INSTANCES
 // =============================================================================
 
-static SPIClass loraSPI(VSPI);
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+static SPIClass loraSPI(FSPI);   // SPI2 on ESP32-S3
+#else
+static SPIClass loraSPI(VSPI);   // VSPI on classic ESP32
+#endif
 static SX1262   radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, loraSPI);
 static CRGB     leds[NUM_LEDS];
-static Bounce   floatSwitch[3];
-static Bounce   btn[5];
 
 // =============================================================================
 // SECTION 7 – REPLAY-ATTACK SEQUENCE TRACKING
@@ -294,6 +323,7 @@ void IRAM_ATTR onPacketReceived() {
 
 static NodeConfig    gConfig;
 static StatsPayload  gStats;
+static uint8_t       gRadioCrashStreak = 0;  // consecutive crash-boots during radio init
 
 static void resetConfigToDefaults() {
     gConfig.pump_min_runtime_ms   = DEF_PUMP_MIN_RUNTIME_MS;
@@ -369,6 +399,7 @@ static void loadConfig() {
     gStats.boot_count      = p.getUShort("bc", 0);
     gStats.last_fault      = p.getUChar("lf", 0);
     gStats.uptime_s        = 0;  // computed at query time
+    gRadioCrashStreak = p.getUChar(NVS_RADIO_STREAK_KEY, 0);
     p.end();
 }
 
@@ -490,9 +521,12 @@ static bool canTurnPumpOff(const PumpHysteresis &ph) {
     return (millis() - ph.lastOnTime_ms) >= gConfig.pump_min_runtime_ms;
 }
 
-static void setPumpState(PumpHysteresis &ph, bool newState, int relay_pin) {
+// relay_pin: GPIO for relay output (active-low); -1 = no local relay (pond, remote only)
+static void setPumpState(PumpHysteresis &ph, bool newState, int8_t relay_pin) {
     if (ph.initialized && (newState == ph.state)) return;
-    if (relay_pin >= 0) digitalWrite((uint8_t)relay_pin, newState ? HIGH : LOW);
+    if (relay_pin >= 0) {
+        digitalWrite((uint8_t)relay_pin, newState ? LOW : HIGH);  // active-low
+    }
     if (newState) ph.lastOnTime_ms  = millis();
     else          ph.lastOffTime_ms = millis();
     ph.state       = newState;
@@ -517,50 +551,66 @@ static inline uint32_t trackPumpOff(uint32_t &onSince) {
 // =============================================================================
 
 static void Task_InputSensorPoll(void *pvParams) {
-    const uint8_t floatPins[3] = { FLOAT_0, FLOAT_1, FLOAT_2 };
-    const uint8_t btnPins[5]   = { BTN_MODE, BTN_P1, BTN_P2, BTN_P3, BTN_POND };
-    const uint8_t curPins[3]   = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
-
-    for (uint8_t i = 0; i < 3; i++) {
-        floatSwitch[i].attach(floatPins[i], INPUT);
-        floatSwitch[i].interval(2000);
-    }
-    for (uint8_t i = 0; i < 5; i++) {
-        btn[i].attach(btnPins[i], INPUT);  // cap module drives line actively
-        btn[i].interval(15);               // no mechanical bounce; 15 ms filters cap noise
-    }
+    const uint8_t curPins[3] = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
+    uint8_t  prevBits        = 0xFF;
+    uint32_t pcfRetryAt_ms   = 0;  // millis() timestamp for next PCF re-init attempt
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
 
-        for (uint8_t i = 0; i < 3; i++) floatSwitch[i].update();
-        for (uint8_t i = 0; i < 5; i++) btn[i].update();
+        // ── PCF8574 hot-plug recovery (retry every 5 s while not present) ────
+        if (!gPcfOk && (millis() >= pcfRetryAt_ms)) {
+            pcfRetryAt_ms = millis() + 5000;
+            if (xSemaphoreTake(xI2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                Wire.beginTransmission(PCF8574_ADDR);
+                Wire.write(0xFF);  // all inputs with pull-ups
+                bool ok = (Wire.endTransmission() == 0);
+                xSemaphoreGive(xI2cMutex);
+                if (ok) {
+                    gPcfOk = true;
+                    prevBits = 0xFF;
+                    Serial.println("\n[PCF] PCF8574 detected — float switch and button inputs enabled");
+                }
+            }
+        }
 
+        // Read all 8 PCF8574 pins in one I2C transaction (skipped if not present)
+        uint8_t currBits = 0xFF;  // safe default: all HIGH → no water, no button presses
+        if (gPcfOk && xSemaphoreTake(xI2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            Wire.requestFrom((uint8_t)PCF8574_ADDR, (uint8_t)1);
+            if (Wire.available() >= 1) {
+                currBits = (uint8_t)Wire.read();
+            }
+            xSemaphoreGive(xI2cMutex);
+        }
+
+        // Falling-edge mask: bits that transitioned HIGH→LOW this tick (active-low press)
+        uint8_t fell = prevBits & ~currBits;
+        prevBits = currBits;
+
+        // Water level: count consecutive LOW float bits from bit 0 upward
         uint8_t level = 0;
         for (uint8_t i = 0; i < 3; i++) {
-            if (floatSwitch[i].read() == LOW) level = (uint8_t)(i + 1);
+            if ((currBits & (1u << i)) == 0) level = (uint8_t)(i + 1);
             else break;
         }
 
+        // ADC current sensing (native analog pins, unchanged)
         uint16_t cur[3];
         for (uint8_t i = 0; i < 3; i++) cur[i] = readCurrentADC(curPins[i]);
-
-        bool edges[5];
-        for (uint8_t i = 0; i < 5; i++)
-            edges[i] = CAP_BTN_ACTIVE_LOW ? btn[i].fell() : btn[i].rose();
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             gState.waterLevel = level;
             gState.currentP1  = cur[0];
             gState.currentP2  = cur[1];
             gState.currentP3  = cur[2];
-            if (edges[0]) gState.btnMode_edge = true;
-            if (edges[1]) gState.btnP1_edge   = true;
-            if (edges[2]) gState.btnP2_edge   = true;
-            if (edges[3]) gState.btnP3_edge   = true;
-            if (edges[4]) gState.btnPond_edge  = true;
+            if (fell & (1u << PCF_BTN_MODE)) gState.btnMode_edge = true;
+            if (fell & (1u << PCF_BTN_P1))   gState.btnP1_edge   = true;
+            if (fell & (1u << PCF_BTN_P2))   gState.btnP2_edge   = true;
+            if (fell & (1u << PCF_BTN_P3))   gState.btnP3_edge   = true;
+            if (fell & (1u << PCF_BTN_POND))  gState.btnPond_edge  = true;
             xSemaphoreGive(xStateMutex);
         }
     }
@@ -594,6 +644,7 @@ static void Task_ControlEngine(void *pvParams) {
     uint8_t  pendingPondAction   = 0;
 
     uint32_t lastTelemetryTime_ms = 0;
+    uint32_t lastStatusPrint_ms   = 0;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -628,6 +679,28 @@ static void Task_ControlEngine(void *pvParams) {
 
         xSemaphoreGive(xStateMutex);
 
+        // ── Live console status (overwrites same line every 2 s) ─────────────
+        if ((now - lastStatusPrint_ms) >= 2000) {
+            lastStatusPrint_ms = now;
+            const char *errStr =
+                faultLockout   ? "FAULT-LOCKOUT" :
+                errorCode == 1 ? "OVERCURRENT"   :
+                errorCode == 2 ? "DRY-RUN"       :
+                errorCode == 3 ? "NO-COMMS"      : "OK";
+            bool buzzerOn = (digitalRead(BUZZER_PIN) == LOW);
+            Serial.printf("\r[%6lus] WL:%u %s | P1:%s P2:%s P3:%s Pond:%s | ADC:%4u/%4u/%4u | %s%s     ",
+                now / 1000,
+                waterLevel,
+                autoMode ? "AUTO" : "MAN ",
+                ph_p1.state   ? "ON " : "off",
+                ph_p2.state   ? "ON " : "off",
+                ph_p3.state   ? "ON " : "off",
+                ph_pond.state ? "ON " : "off",
+                curP1, curP2, curP3,
+                errStr,
+                buzzerOn ? " BUZZ" : "");
+        }
+
         // ── Overcurrent / dry-run protection (inrush grace period) ───────────────
         // Grace counters accumulate consecutive 50 ms ticks above/below threshold.
         // A fault only triggers after overcurrent_grace_ticks consecutive detections
@@ -656,10 +729,14 @@ static void Task_ControlEngine(void *pvParams) {
             if (overCurrent || dryRun) {
                 uint8_t faultCode = overCurrent ? 1 : 2;
                 if (gConfig.fault_lockout_enabled) {
-                    // Hard trip – kill relays immediately, bypass hysteresis
-                    digitalWrite(RELAY_P1, LOW); gStats.runtime_p1_s += trackPumpOff(onSince_p1);
-                    digitalWrite(RELAY_P2, LOW); gStats.runtime_p2_s += trackPumpOff(onSince_p2);
-                    digitalWrite(RELAY_P3, LOW); gStats.runtime_p3_s += trackPumpOff(onSince_p3);
+                    // Hard trip – kill all relays and sound buzzer
+                    digitalWrite(RELAY_P1, HIGH);
+                    digitalWrite(RELAY_P2, HIGH);
+                    digitalWrite(RELAY_P3, HIGH);
+                    digitalWrite(BUZZER_PIN, LOW);
+                    gStats.runtime_p1_s += trackPumpOff(onSince_p1);
+                    gStats.runtime_p2_s += trackPumpOff(onSince_p2);
+                    gStats.runtime_p3_s += trackPumpOff(onSince_p3);
                     ph_p1.state = false; ph_p1.lastOffTime_ms = now;
                     ph_p2.state = false; ph_p2.lastOffTime_ms = now;
                     ph_p3.state = false; ph_p3.lastOffTime_ms = now;
@@ -696,10 +773,11 @@ static void Task_ControlEngine(void *pvParams) {
                     gState.errorCode    = 0;
                     xSemaphoreGive(xStateMutex);
                 }
+                digitalWrite(BUZZER_PIN, HIGH);
             }
-            bool networkOkWhileFaulted =
-                ((now - lastGateway) < gConfig.network_timeout_ms) &&
-                ((now - lastPond)    < gConfig.network_timeout_ms);
+            bool networkOkWhileFaulted = !gRadioOk ||
+                (((now - lastGateway) < gConfig.network_timeout_ms) &&
+                 ((now - lastPond)    < gConfig.network_timeout_ms));
             if (!networkOkWhileFaulted) {
                 if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                     if (gState.errorCode == 0) gState.errorCode = 3;
@@ -710,8 +788,10 @@ static void Task_ControlEngine(void *pvParams) {
         }
 
         // ── Network-timeout assessment ───────────────────────────────────────
-        bool networkOk = ((now - lastGateway) < gConfig.network_timeout_ms) &&
-                         ((now - lastPond)    < gConfig.network_timeout_ms);
+        // When radio is absent, treat network as always OK to suppress error code 3.
+        bool networkOk = !gRadioOk ||
+            (((now - lastGateway) < gConfig.network_timeout_ms) &&
+             ((now - lastPond)    < gConfig.network_timeout_ms));
 
         // ── Mode toggle ──────────────────────────────────────────────────────
         if (btnMode) {
@@ -869,15 +949,17 @@ static void Task_ControlEngine(void *pvParams) {
                     saveStats();  // record fill cycle start; leak-detection counter
                     setPumpState(ph_pond, true, -1);
                     trackPumpOn(onSince_pond);
-                    pendingPondAction   = 1;
-                    awaitingAckInternal = true;
-                    ackSentTime_ms      = now;
-                    ackRetryCount       = 0;
-                    sendPumpCommand(NODE_POND_REMOTE, 1, 1);
-                    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                        gState.pondPump    = true;
-                        gState.awaitingAck = true;
-                        xSemaphoreGive(xStateMutex);
+                    if (gRadioOk) {
+                        pendingPondAction   = 1;
+                        awaitingAckInternal = true;
+                        ackSentTime_ms      = now;
+                        ackRetryCount       = 0;
+                        sendPumpCommand(NODE_POND_REMOTE, 1, 1);
+                        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                            gState.pondPump    = true;
+                            gState.awaitingAck = true;
+                            xSemaphoreGive(xStateMutex);
+                        }
                     }
                 }
             } else if (replenishActive) {
@@ -887,15 +969,17 @@ static void Task_ControlEngine(void *pvParams) {
                     gStats.runtime_pond_s += trackPumpOff(onSince_pond);
                     setPumpState(ph_pond, false, -1);
                     saveStats();
-                    pendingPondAction   = 0;
-                    awaitingAckInternal = true;
-                    ackSentTime_ms      = now;
-                    ackRetryCount       = 0;
-                    sendPumpCommand(NODE_POND_REMOTE, 1, 0);
-                    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                        gState.pondPump    = false;
-                        gState.awaitingAck = true;
-                        xSemaphoreGive(xStateMutex);
+                    if (gRadioOk) {
+                        pendingPondAction   = 0;
+                        awaitingAckInternal = true;
+                        ackSentTime_ms      = now;
+                        ackRetryCount       = 0;
+                        sendPumpCommand(NODE_POND_REMOTE, 1, 0);
+                        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                            gState.pondPump    = false;
+                            gState.awaitingAck = true;
+                            xSemaphoreGive(xStateMutex);
+                        }
                     }
                 }
             }
@@ -938,7 +1022,7 @@ static void Task_ControlEngine(void *pvParams) {
                     saveStats();
                 }
             }
-            if (btnPond) {
+            if (btnPond && gRadioOk) {
                 bool want = !ph_pond.state;
                 if (want && canTurnPumpOn(ph_pond)) {
                     setPumpState(ph_pond, true, -1);
@@ -993,6 +1077,15 @@ static void Task_ControlEngine(void *pvParams) {
 // =============================================================================
 
 static void Task_LoRaTransceiver(void *pvParams) {
+    if (!gRadioOk) {
+        // Radio not initialised — silently drain TX queue and idle.
+        LoRaPacket discard;
+        for (;;) {
+            while (xQueueReceive(xTxQueue, &discard, 0) == pdTRUE) {}
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
     uint8_t rxBuf[sizeof(LoRaPacket)];
 
     for (;;) {
@@ -1057,11 +1150,17 @@ static void Task_LoRaTransceiver(void *pvParams) {
 // =============================================================================
 
 static void Task_UIAnimation(void *pvParams) {
-    uint8_t  pulsePhase     = 0;
+    // slow ~1.9 s cycle (256 steps × 30 ms / 4)
+    uint8_t  pulsePhase   = 0;
+    // fast ~384 ms cycle (256 / 20 × 30 ms) — fault strobe, ACK pulse
+    uint8_t  fastPhase    = 0;
+    // water shimmer wave ~700 ms cycle (256 / 11 × 30 ms)
+    uint8_t  shimmerPhase = 0;
+    // pump breathing ~640 ms cycle (256 / 12 × 30 ms)
+    uint8_t  pumpPhase    = 0;
+
     uint32_t lastRxFlash_ms = 0;
     uint32_t lastTxFlash_ms = 0;
-    uint32_t netFlashToggle = 0;
-    bool     netFlashOn     = false;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -1094,53 +1193,104 @@ static void Task_UIAnimation(void *pvParams) {
         if (rxFlash) lastRxFlash_ms = now;
         if (txFlash) lastTxFlash_ms = now;
 
+        pulsePhase   += 4;
+        fastPhase    += 20;
+        shimmerPhase += 11;
+        pumpPhase    += 12;
+
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // LEDs 0-2: water level (aqua fill from bottom, 3 float switches -> level 0-3)
-        for (uint8_t i = 0; i < waterLevel && i < 3; i++) leds[i] = CRGB(0, 180, 220);
-
-        // LED 4: system status (priority order)
-        if (faultLockout || errorCode == 1 || errorCode == 2) {
-            leds[4] = CRGB::Red;
-
-        } else if (errorCode == 3) {
-            if ((now - netFlashToggle) >= FLASH_NET_MS) {
-                netFlashToggle = now;
-                netFlashOn     = !netFlashOn;
-            }
-            leds[4] = netFlashOn ? CRGB::Red : CRGB::Black;
-
-        } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
-            leds[4] = CRGB(148, 0, 211);   // purple - RX
-
-        } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
-            leds[4] = CRGB::Cyan;           // TX
-
-        } else if (awaitingAck) {
-            // Triangle-wave pulse yellow
-            pulsePhase = (uint8_t)((pulsePhase + 10) & 0xFF);
-            uint8_t bri = (pulsePhase < 128)
-                          ? (uint8_t)(pulsePhase * 2)
-                          : (uint8_t)((255 - pulsePhase) * 2);
-            leds[4] = CRGB(bri, bri, 0);
-
-        } else if (autoMode) {
-            leds[4] = CRGB::Green;
-
+        // --- LEDs 0-3: water level bar (3 float switches → 4 LEDs) ---
+        // level 0 = empty (all 4 pulse dim red)
+        // level 1 = low   (LED 0 lit, LED 1 surface ripple, 2-3 dark hint)
+        // level 2 = mid   (LEDs 0-1 lit, LED 2 surface ripple, LED 3 dark hint)
+        // level 3 = full  (LEDs 0-2 lit, LED 3 bright pulsing full-indicator)
+        if (waterLevel == 0) {
+            uint8_t bri = scale8(sin8(pulsePhase), 50);
+            for (uint8_t i = 0; i < 4; i++) leds[i] = CRGB(bri, 0, 0);
         } else {
-            leds[4] = CRGB::Blue;
+            for (uint8_t i = 0; i < 4; i++) {
+                if (i < waterLevel) {
+                    // lit water body — sine shimmer wave across LEDs
+                    uint8_t s = 150 + scale8(sin8(shimmerPhase + i * 64), 70);
+                    leds[i] = CRGB(0, s, s >> 1);
+                } else if (i == waterLevel) {
+                    // surface LED — faint ripple one step above fill line
+                    uint8_t surf = scale8(sin8((uint8_t)(shimmerPhase * 2 + 128)), 25);
+                    leds[i] = CRGB(0, surf, surf);
+                } else {
+                    leds[i] = CRGB(0, 0, 6);  // empty upper zone: dark blue hint
+                }
+            }
+            if (waterLevel >= 3) {
+                // tank full: LED 3 pulses bright aqua as a "full" indicator
+                uint8_t bri = 180 + scale8(sin8((uint8_t)(pulsePhase * 3)), 75);
+                leds[3] = CRGB(0, bri >> 1, bri);
+            }
         }
 
-        // LED 5: mode indicator
-        leds[5] = autoMode ? CRGB::Green : CRGB::Blue;
+        // --- LED 4: system status ---
+        if (faultLockout || errorCode == 1 || errorCode == 2) {
+            // hard fault: fast red strobe
+            leds[4] = (fastPhase < 128) ? CRGB(255, 0, 0) : CRGB(25, 0, 0);
 
-        // LEDs 6-8: local relay states
-        leds[6] = relay_p1 ? CRGB::Green : CRGB(30, 0, 0);
-        leds[7] = relay_p2 ? CRGB::Green : CRGB(30, 0, 0);
-        leds[8] = relay_p3 ? CRGB::Green : CRGB(30, 0, 0);
+        } else if (errorCode == 3) {
+            // comms error: slow red breathing
+            uint8_t bri = scale8(sin8(pulsePhase), 200) + 20;
+            leds[4] = CRGB(bri, 0, 0);
 
-        // LED 9: remote pond pump
-        leds[9] = pondPump ? CRGB::Cyan : CRGB(0, 0, 30);
+        } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
+            leds[4] = CRGB(148, 0, 211);   // purple RX flash
+
+        } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
+            leds[4] = CRGB(0, 220, 220);   // cyan TX flash
+
+        } else if (awaitingAck) {
+            // fast yellow triangle pulse
+            leds[4] = CRGB(triwave8(fastPhase), triwave8(fastPhase), 0);
+
+        } else if (autoMode) {
+            // auto OK: slow breathing green
+            uint8_t bri = scale8(sin8(pulsePhase), 180) + 40;
+            leds[4] = CRGB(0, bri, 0);
+
+        } else {
+            leds[4] = CRGB(0, 0, 160);     // manual: steady blue
+        }
+
+        // --- LED 5: mode indicator ---
+        if (autoMode) {
+            uint8_t bri = scale8(sin8((uint8_t)(pulsePhase + 128)), 100) + 80;
+            leds[5] = CRGB(0, bri, 0);     // breathing green
+        } else {
+            leds[5] = CRGB(0, 0, 120);     // steady blue
+        }
+
+        // --- LEDs 6-8: local relay states ---
+        // running: breathing green (each pump offset 120° so they pulse independently)
+        // off: dim dark red
+        const bool relays[3] = { relay_p1, relay_p2, relay_p3 };
+        for (uint8_t i = 0; i < 3; i++) {
+            if (relays[i]) {
+                uint8_t bri = scale8(sin8((uint8_t)(pumpPhase + i * 85)), 150) + 80;
+                leds[6 + i] = CRGB(0, bri, 0);
+            } else {
+                leds[6 + i] = CRGB(25, 0, 0);
+            }
+        }
+
+        // --- LED 9: remote pond pump ---
+        if (!gRadioOk) {
+            // no radio: dim orange slow pulse
+            uint8_t bri = scale8(sin8(pulsePhase), 30) + 15;
+            leds[9] = CRGB(bri, bri >> 2, 0);
+        } else if (pondPump) {
+            // running: breathing cyan (phase offset from local pumps)
+            uint8_t bri = scale8(sin8((uint8_t)(pumpPhase + 170)), 160) + 60;
+            leds[9] = CRGB(0, bri, bri);
+        } else {
+            leds[9] = CRGB(0, 0, 30);      // idle + radio OK: dim blue
+        }
 
         FastLED.show();
     }
@@ -1150,11 +1300,38 @@ static void Task_UIAnimation(void *pvParams) {
 // SECTION 16 – SETUP
 // =============================================================================
 
+static const char* resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "Power-on";
+        case ESP_RST_EXT:       return "External reset pin";
+        case ESP_RST_SW:        return "Software reset";
+        case ESP_RST_PANIC:     return "Panic / exception";
+        case ESP_RST_INT_WDT:   return "Interrupt watchdog";
+        case ESP_RST_TASK_WDT:  return "Task watchdog  ← likely a hang during init";
+        case ESP_RST_WDT:       return "Other watchdog";
+        case ESP_RST_BROWNOUT:  return "Brownout (low supply voltage)";
+        case ESP_RST_DEEPSLEEP: return "Deep-sleep wakeup";
+        default:                return "Unknown";
+    }
+}
+
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n[BOOT] Tank Controller Node 0x02 v1.1 starting...");
+    delay(3000);  // allow time for serial monitor to connect
+
+    esp_reset_reason_t rr = esp_reset_reason();
+    Serial.println("\n============================================================");
+    Serial.println("[BOOT] Tank Controller Node 0x02 v1.1");
+    Serial.printf( "[BOOT] Reset reason : %s\n", resetReasonStr(rr));
+    if (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_PANIC) {
+        Serial.println("[BOOT] WARNING       : Abnormal reset — probably a hang or crash");
+        Serial.println("[BOOT]                 during the previous boot's hardware init.");
+        Serial.println("[BOOT]                 If this repeats, check SX1262 wiring.");
+    }
+    Serial.println("------------------------------------------------------------");
 
     // ── Load NVS config and stats ─────────────────────────────────────────────
+    Serial.println("[INIT] Loading NVS config and stats...");
     loadConfig();
     gStats.boot_count++;
     {
@@ -1163,22 +1340,49 @@ void setup() {
         p.putUShort("bc", gStats.boot_count);
         p.end();
     }
-    Serial.printf("[BOOT] Boot #%u  |  auto=%u  |  fill cycles=%u\n",
-                  gStats.boot_count, gConfig.boot_auto_mode, gStats.fill_cycles);
+    Serial.printf("[BOOT] Boot #%u  |  auto=%u  |  fill_cycles=%u  |  last_fault=%u\n",
+                  gStats.boot_count, gConfig.boot_auto_mode,
+                  gStats.fill_cycles, gStats.last_fault);
+    Serial.printf("[BOOT] Runtime  : P1=%lus  P2=%lus  P3=%lus  Pond=%lus\n",
+                  gStats.runtime_p1_s, gStats.runtime_p2_s,
+                  gStats.runtime_p3_s, gStats.runtime_pond_s);
+    Serial.printf("[BOOT] Config   : min_run=%lus  cooldown=%lus  replenish=%lus\n",
+                  gConfig.pump_min_runtime_ms / 1000,
+                  gConfig.pump_min_cooldown_ms / 1000,
+                  gConfig.replenish_runon_ms / 1000);
+    Serial.printf("[BOOT] Radio crash streak: %u  (skip after %u)\n",
+                  gRadioCrashStreak, (uint8_t)RADIO_SKIP_STREAK);
+    Serial.println("------------------------------------------------------------");
 
     // ── GPIO ─────────────────────────────────────────────────────────────────
-    pinMode(RELAY_P1, OUTPUT); digitalWrite(RELAY_P1, LOW);
-    pinMode(RELAY_P2, OUTPUT); digitalWrite(RELAY_P2, LOW);
-    pinMode(RELAY_P3, OUTPUT); digitalWrite(RELAY_P3, LOW);
+    // Relay outputs (active-low: HIGH = relay OFF)
+    pinMode(RELAY_P1, OUTPUT); digitalWrite(RELAY_P1, HIGH);
+    pinMode(RELAY_P2, OUTPUT); digitalWrite(RELAY_P2, HIGH);
+    pinMode(RELAY_P3, OUTPUT); digitalWrite(RELAY_P3, HIGH);
+    // Buzzer output (active-low: HIGH = silent)
+    pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, HIGH);
+    Serial.printf("[INIT] Relays: P1=GPIO%d  P2=GPIO%d  P3=GPIO%d  Buzzer=GPIO%d\n",
+                  RELAY_P1, RELAY_P2, RELAY_P3, BUZZER_PIN);
 
-    analogSetWidth(12);
+    analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
+    Serial.printf("[INIT] ADC pins: currentP1=GPIO%d  currentP2=GPIO%d  currentP3=GPIO%d\n",
+                  CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC);
+
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.beginTransmission(PCF8574_ADDR);
+    Wire.write(0xFF);  // all 8 pins: inputs with pull-ups enabled
+    gPcfOk = (Wire.endTransmission() == 0);
+    Serial.printf("[INIT] PCF8574 I2C: SDA=GPIO%d  SCL=GPIO%d  addr=0x%02X  %s\n",
+                  I2C_SDA, I2C_SCL, PCF8574_ADDR,
+                  gPcfOk ? "OK — float switches on bits 0-2, buttons on bits 3-7"
+                         : "not found — float switch and button inputs disabled");
 
     // ── FastLED ───────────────────────────────────────────────────────────────
+    Serial.printf("[INIT] WS2812B: GPIO%d  %d LEDs\n", WS2812B_PIN, NUM_LEDS);
     FastLED.addLeds<WS2812B, WS2812B_PIN, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(80);
     fill_solid(leds, NUM_LEDS, CRGB::Black);
-    FastLED.show();
 
     // ── Global state ──────────────────────────────────────────────────────────
     memset(&gState, 0, sizeof(gState));
@@ -1187,8 +1391,12 @@ void setup() {
     gState.lastPondContact_ms    = millis();
 
     // ── FreeRTOS primitives ───────────────────────────────────────────────────
+    Serial.println("[INIT] Creating FreeRTOS primitives...");
     xStateMutex = xSemaphoreCreateMutex();
     configASSERT(xStateMutex != nullptr);
+
+    xI2cMutex = xSemaphoreCreateMutex();
+    configASSERT(xI2cMutex != nullptr);
 
     xLoRaIrqSemaphore = xSemaphoreCreateBinary();
     configASSERT(xLoRaIrqSemaphore != nullptr);
@@ -1200,50 +1408,131 @@ void setup() {
     configASSERT(xRxQueue != nullptr);
 
     // ── RadioLib SX1262 ───────────────────────────────────────────────────────
-    loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+    Serial.println("------------------------------------------------------------");
+    Serial.printf("[INIT] SX1262 SPI : SCK=GPIO%d  MISO=GPIO%d  MOSI=GPIO%d  NSS=GPIO%d\n",
+                  LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+    Serial.printf("[INIT] SX1262 ctrl: RST=GPIO%d  BUSY=GPIO%d  DIO1=GPIO%d\n",
+                  LORA_NRST, LORA_BUSY, LORA_DIO1);
+    Serial.printf("[INIT] RF settings: %.1f MHz  BW=%.0f kHz  SF%d  CR4/%d  PWR=%d dBm\n",
+                  LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SF, LORA_CR, LORA_TX_POWER);
+    Serial.flush();  // ensure RF settings reach the monitor before any potentially-hanging operation
 
-    int radioState = radio.begin(
-        LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SF,
-        LORA_CR, LORA_SYNC_WORD, LORA_TX_POWER, LORA_PREAMBLE);
-
-    if (radioState != RADIOLIB_ERR_NONE) {
-        Serial.printf("[FATAL] RadioLib begin() failed: %d\n", radioState);
-        fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show();
-        for (;;) vTaskDelay(portMAX_DELAY);
+    // Crash-streak guard: if the last RADIO_SKIP_STREAK boots ended in INT_WDT or
+    // Panic (likely during radio init), skip radio init entirely this boot and let
+    // the user recover via standalone mode.  Cleared on a successful radio boot.
+    bool skipRadioInit = false;
+    if (gRadioCrashStreak >= RADIO_SKIP_STREAK) {
+        skipRadioInit = true;
+        Serial.printf("[WARN] Radio init skipped — %u consecutive crash-boots detected.\n", gRadioCrashStreak);
+        Serial.println("[WARN] Booting in forced standalone mode.  Reset the crash counter by");
+        Serial.println("[WARN] erasing NVS (pio run -t erase) or repairing the SX1262 wiring.");
     }
 
-    radio.setCRC(true);
-    radio.setPacketReceivedAction(onPacketReceived);
-
-    radioState = radio.startReceive();
-    if (radioState != RADIOLIB_ERR_NONE) {
-        Serial.printf("[FATAL] RadioLib startReceive() failed: %d\n", radioState);
-        fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show();
-        for (;;) vTaskDelay(portMAX_DELAY);
+    // Increment streak now; reset to 0 after init completes (success or soft-failure).
+    // A crash (INT_WDT/Panic) before the reset leaves the counter elevated in NVS.
+    if (!skipRadioInit) {
+        Preferences p;
+        p.begin(NVS_NAMESPACE, false);
+        p.putUChar(NVS_RADIO_STREAK_KEY, (uint8_t)(gRadioCrashStreak + 1));
+        p.end();
     }
 
-    Serial.printf("[BOOT] Radio OK  |  Packet size: %u bytes\n",
-                  (unsigned)sizeof(LoRaPacket));
+    if (!skipRadioInit) {
+        // Pre-check BUSY with a pull-up so a floating (absent/unpowered) module reads HIGH.
+        // The SX1262 actively drives BUSY LOW when idle, overriding the pull-up.
+        // Without the pull-up a floating pin can read LOW and enter a crashing init path.
+        pinMode(LORA_BUSY, INPUT_PULLUP);
+        delayMicroseconds(200);  // let pull-up settle
+        bool busyLow = (digitalRead(LORA_BUSY) == LOW);
+        pinMode(LORA_BUSY, INPUT);  // release pull-up; RadioLib reconfigures during begin()
+
+        if (!busyLow) {
+            Serial.println("[WARN] LORA_BUSY not driven LOW → SX1262 absent, unpowered, or wiring error.");
+            Serial.println("[WARN] Skipping radio init.  Check: module power, RST/BUSY/SPI wiring.");
+            Serial.flush();
+        } else {
+            Serial.println("[INIT] LORA_BUSY is LOW → SX1262 detected. Initialising SPI...");
+            Serial.flush();
+
+            loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+            Serial.println("[INIT] SPI ready.  Calling radio.begin()...");
+            Serial.flush();
+
+            int radioState = radio.begin(
+                LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SF,
+                LORA_CR, LORA_SYNC_WORD, LORA_TX_POWER, LORA_PREAMBLE);
+
+            if (radioState != RADIOLIB_ERR_NONE) {
+                Serial.printf("[ERROR] radio.begin() failed — RadioLib code %d\n", radioState);
+                Serial.println("[ERROR] Possible causes:");
+                Serial.println("[ERROR]   • SPI wiring error  (SCK / MISO / MOSI / NSS)");
+                Serial.println("[ERROR]   • RST or BUSY pin disconnected or shorted");
+                Serial.println("[ERROR]   • Module not powered or damaged");
+            } else {
+                radio.setCRC(true);
+                radio.setPacketReceivedAction(onPacketReceived);
+                radioState = radio.startReceive();
+                if (radioState != RADIOLIB_ERR_NONE) {
+                    Serial.printf("[ERROR] radio.startReceive() failed — RadioLib code %d\n", radioState);
+                } else {
+                    gRadioOk = true;
+                    Serial.printf("[BOOT] Radio OK  |  %.1f MHz  |  Packet size: %u bytes\n",
+                                  LORA_FREQUENCY, (unsigned)sizeof(LoRaPacket));
+                }
+            }
+        }
+        // We reached this point without crashing — reset streak regardless of success/failure.
+        // The streak only stays elevated if the device crashes (INT_WDT/Panic) before reaching here.
+        {
+            Preferences p;
+            p.begin(NVS_NAMESPACE, false);
+            p.putUChar(NVS_RADIO_STREAK_KEY, 0);
+            p.end();
+        }
+    }
+
+    if (!gRadioOk) {
+        Serial.println("[WARN] *** STANDALONE MODE — LoRa disabled ***");
+        Serial.println("[WARN]     Local pumps P1/P2/P3, float switches, buttons, LEDs: fully operational.");
+        Serial.println("[WARN]     Pond pump and gateway communication: disabled.");
+        Serial.println("[WARN]     Fix hardware and reset to enable LoRa.");
+        Serial.flush();
+        // Note: no FastLED.show() here — FastLED's legacy RMT backend on ESP32-S3
+        // disables CPU interrupts during the busy-wait and can exceed the 300 ms
+        // INT_WDT threshold.  UIAnimation (Core 1, 30 ms tick) will light the LEDs
+        // as soon as the task scheduler starts.
+    }
+    Serial.println("------------------------------------------------------------");
 
     // ── FreeRTOS tasks ────────────────────────────────────────────────────────
+    Serial.println("[INIT] Starting FreeRTOS tasks..."); Serial.flush();
     BaseType_t rc;
 
-    // Priority scheme: pump control is most critical, LoRa is secondary.
-    // Core 1: InputSensorPoll P3 feeds ControlEngine P4 (pump logic is king)
-    // Core 0: LoRaTransceiver P2, UIAnimation P1
+    // Core 1: InputSensorPoll P3, ControlEngine P4, UIAnimation P1
+    //   FastLED RMT driver is initialised in setup() which runs on Core 1.
+    //   Calling FastLED.show() from Core 0 can block the RMT wait with interrupts
+    //   disabled long enough to trigger INT_WDT — keep UIAnimation on Core 1.
+    // Core 0: LoRaTransceiver P2 (event-driven, no FastLED)
     rc = xTaskCreatePinnedToCore(Task_InputSensorPoll, "InputPoll", 4096, nullptr, 3, nullptr, 1);
     configASSERT(rc == pdPASS);
+    Serial.println("[INIT]   InputSensorPoll  → Core 1  Priority 3  OK"); Serial.flush();
 
     rc = xTaskCreatePinnedToCore(Task_ControlEngine,   "CtrlEng",  8192, nullptr, 4, nullptr, 1);
     configASSERT(rc == pdPASS);
+    Serial.println("[INIT]   ControlEngine    → Core 1  Priority 4  OK"); Serial.flush();
 
     rc = xTaskCreatePinnedToCore(Task_LoRaTransceiver, "LoRaTx",   8192, nullptr, 2, nullptr, 0);
     configASSERT(rc == pdPASS);
+    Serial.println("[INIT]   LoRaTransceiver  → Core 0  Priority 2  OK"); Serial.flush();
 
-    rc = xTaskCreatePinnedToCore(Task_UIAnimation,     "UIAnim",   4096, nullptr, 1, nullptr, 0);
+    rc = xTaskCreatePinnedToCore(Task_UIAnimation,     "UIAnim",   8192, nullptr, 1, nullptr, 1);
     configASSERT(rc == pdPASS);
+    Serial.println("[INIT]   UIAnimation      → Core 1  Priority 1  OK"); Serial.flush();
 
-    Serial.println("[BOOT] All tasks created.  System operational.");
+    Serial.println("============================================================");
+    Serial.println("[BOOT] System operational.");
+    Serial.println("============================================================");
 }
 
 // =============================================================================
