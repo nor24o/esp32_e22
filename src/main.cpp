@@ -2,7 +2,7 @@
 // TANK CONTROLLER NODE (0x02)  –  Production Firmware v1.1
 // Target  : Espressif ESP32 (Xtensa LX6 Dual-Core)
 // Framework: Arduino + FreeRTOS
-// Libraries: RadioLib (SX1262), FastLED (WS2812B), Bounce2, Preferences
+// Libraries: RadioLib (SX1262), FastLED (WS2812B), Adafruit_MCP23X17, Preferences
 //
 // Protocol v1.1 vs v1.0:
 //   • TelemetryData gains last_rssi (int8) and last_snr (int8) — wire-breaking change
@@ -11,7 +11,8 @@
 //   • All timing/threshold constants now live in NVS-backed NodeConfig (gConfig)
 //
 // HARDWARE NOTES:
-//   • GPIO 34-39: input-only, no internal pull-up.  Install 10 kΩ to 3.3 V.
+//   • MCP23017 I2C expander (0x20): all 5 cap-touch buttons + 3 float switches on GPA0-GPA7.
+//   • GPIO 21 = SDA, GPIO 22 = SCL (shared I2C bus; keep traces short, 4.7 kΩ pull-ups to 3.3 V).
 //   • GPIO 2  (CURRENT_P3_ADC): strapping pin — sensor output must be < 0.6 V at power-on (pump off = safe).
 //   • GPIO 17 (RELAY_P3): safe digital output, no strapping concerns.
 //   • RadioLib transmit() blocks; at SF9/125 kHz max payload ≈ 330 ms.
@@ -19,10 +20,11 @@
 // =============================================================================
 
 #include <Arduino.h>
+#include <Wire.h>
 #include <SPI.h>
 #include <RadioLib.h>
 #include <FastLED.h>
-#include <Bounce2.h>
+#include <Adafruit_MCP23X17.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -46,24 +48,33 @@
 #define WS2812B_PIN  12
 #define NUM_LEDS     10
 
-#define BTN_MODE  32
-#define BTN_P1    33
-#define BTN_P2    25
-#define BTN_P3    21
-#define BTN_POND  22
+// I2C bus (shared by MCP23017)
+#define I2C_SDA  21
+#define I2C_SCL  22
 
-#define FLOAT_0  34   // ADC1 – input-only, safe
-#define FLOAT_1  35   // ADC1 – input-only, safe
-#define FLOAT_2  36   // ADC1 – input-only, safe
-// 3 float switches → water level 0-3
+// MCP23017 I2C expander — all buttons and float switches on Port A (GPA0-GPA7)
+#define MCP_I2C_ADDR  0x20   // A0=A1=A2=GND → default address
+
+// GPA0-GPA4: capacitive touch buttons (TTP223 drives line actively)
+#define MCP_BTN_MODE  0   // GPA0
+#define MCP_BTN_P1    1   // GPA1
+#define MCP_BTN_P2    2   // GPA2
+#define MCP_BTN_P3    3   // GPA3
+#define MCP_BTN_POND  4   // GPA4
+
+// GPA5-GPA7: float switches (NC, connect pin to GND when water reaches level)
+// MCP23017 internal 100 kΩ pull-up enabled; active = LOW
+#define MCP_FLOAT_0   5   // GPA5 – bottom
+#define MCP_FLOAT_1   6   // GPA6 – mid
+#define MCP_FLOAT_2   7   // GPA7 – top
 
 #define RELAY_P1  13
 #define RELAY_P2  15
 #define RELAY_P3  17  // was GPIO 2 (strapping pin) → moved to safe GPIO 17
 
 #define CURRENT_P1_ADC  4   // ADC2_CH0
-#define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe (was GPIO 0, strapping pin)
-#define CURRENT_P3_ADC  2   // ADC2_CH2 – freed when relay moved to 17 (was GPIO 3, not ADC capable)
+#define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe
+#define CURRENT_P3_ADC  2   // ADC2_CH2
 
 // =============================================================================
 // SECTION 2 – COMPILE-TIME CONSTANTS AND DEFAULTS
@@ -244,11 +255,10 @@ static QueueHandle_t     xRxQueue          = nullptr;
 // SECTION 6 – PERIPHERAL INSTANCES
 // =============================================================================
 
-static SPIClass loraSPI(VSPI);
-static SX1262   radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, loraSPI);
-static CRGB     leds[NUM_LEDS];
-static Bounce   floatSwitch[3];
-static Bounce   btn[5];
+static SPIClass          loraSPI(VSPI);
+static SX1262            radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY, loraSPI);
+static CRGB              leds[NUM_LEDS];
+static Adafruit_MCP23X17 mcp;
 
 // =============================================================================
 // SECTION 7 – REPLAY-ATTACK SEQUENCE TRACKING
@@ -530,17 +540,24 @@ static inline uint32_t trackPumpOff(uint32_t &onSince) {
 // =============================================================================
 
 static void Task_InputSensorPoll(void *pvParams) {
-    const uint8_t floatPins[3] = { FLOAT_0, FLOAT_1, FLOAT_2 };
-    const uint8_t btnPins[5]   = { BTN_MODE, BTN_P1, BTN_P2, BTN_P3, BTN_POND };
-    const uint8_t curPins[3]   = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
+    const uint8_t curPins[3] = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
 
-    for (uint8_t i = 0; i < 3; i++) {
-        floatSwitch[i].attach(floatPins[i], INPUT);
-        floatSwitch[i].interval(2000);
-    }
-    for (uint8_t i = 0; i < 5; i++) {
-        btn[i].attach(btnPins[i], INPUT);  // cap module drives line actively
-        btn[i].interval(15);               // no mechanical bounce; 15 ms filters cap noise
+    // Per-pin debounce state for all 8 MCP GPA pins.
+    // Each entry tracks the last confirmed stable level, the candidate level
+    // being debounced, and how many consecutive 20 ms ticks it has held.
+    //
+    // Buttons  (GPA0-4): cap module drives line; 1 tick  =  20 ms window
+    // Floats   (GPA5-7): mechanical reed/float;  100 ticks = 2 000 ms window
+    struct PinDb {
+        bool    stable;   // last committed state (HIGH on reset with pull-up)
+        bool    pending;  // candidate state currently being timed
+        uint8_t count;    // consecutive ticks at 'pending'
+        uint8_t thresh;   // ticks required to commit
+    };
+
+    PinDb db[8];
+    for (uint8_t i = 0; i < 8; i++) {
+        db[i] = { true, true, 0, (i < 5) ? (uint8_t)1 : (uint8_t)100 };
     }
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -548,32 +565,55 @@ static void Task_InputSensorPoll(void *pvParams) {
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
 
-        for (uint8_t i = 0; i < 3; i++) floatSwitch[i].update();
-        for (uint8_t i = 0; i < 5; i++) btn[i].update();
+        // Read all 8 GPA pins in one I2C transaction
+        uint8_t port = mcp.readGPIOA();
 
+        bool fell[8] = {};   // HIGH→LOW transition confirmed this tick
+        bool rose[8] = {};   // LOW→HIGH transition confirmed this tick
+
+        for (uint8_t i = 0; i < 8; i++) {
+            bool raw = (port >> i) & 1u;
+            if (raw == db[i].pending) {
+                if (db[i].count < db[i].thresh) db[i].count++;
+                if (db[i].count >= db[i].thresh && raw != db[i].stable) {
+                    fell[i]      = db[i].stable && !raw;
+                    rose[i]      = !db[i].stable && raw;
+                    db[i].stable = raw;
+                }
+            } else {
+                // Direction changed before threshold — restart the timer
+                db[i].pending = raw;
+                db[i].count   = 0;
+            }
+        }
+
+        // Cap-touch buttons: GPA0-4 — active low (TTP223 default) or active high
+        bool btnEdge[5];
+        for (uint8_t i = 0; i < 5; i++)
+            btnEdge[i] = CAP_BTN_ACTIVE_LOW ? fell[i] : rose[i];
+
+        // Float switches: GPA5-7 — active low (pull-up + switch to GND)
+        // Level = highest consecutive LOW switch from bottom (0) upward.
         uint8_t level = 0;
         for (uint8_t i = 0; i < 3; i++) {
-            if (floatSwitch[i].read() == LOW) level = (uint8_t)(i + 1);
+            if (!db[MCP_FLOAT_0 + i].stable) level = (uint8_t)(i + 1);
             else break;
         }
 
+        // Current sensors (direct ESP32 ADC)
         uint16_t cur[3];
         for (uint8_t i = 0; i < 3; i++) cur[i] = readCurrentADC(curPins[i]);
-
-        bool edges[5];
-        for (uint8_t i = 0; i < 5; i++)
-            edges[i] = CAP_BTN_ACTIVE_LOW ? btn[i].fell() : btn[i].rose();
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             gState.waterLevel = level;
             gState.currentP1  = cur[0];
             gState.currentP2  = cur[1];
             gState.currentP3  = cur[2];
-            if (edges[0]) gState.btnMode_edge = true;
-            if (edges[1]) gState.btnP1_edge   = true;
-            if (edges[2]) gState.btnP2_edge   = true;
-            if (edges[3]) gState.btnP3_edge   = true;
-            if (edges[4]) gState.btnPond_edge  = true;
+            if (btnEdge[0]) gState.btnMode_edge = true;
+            if (btnEdge[1]) gState.btnP1_edge   = true;
+            if (btnEdge[2]) gState.btnP2_edge   = true;
+            if (btnEdge[3]) gState.btnP3_edge   = true;
+            if (btnEdge[4]) gState.btnPond_edge  = true;
             xSemaphoreGive(xStateMutex);
         }
     }
@@ -1243,6 +1283,18 @@ void setup() {
     }
     Serial.printf("[BOOT] Boot #%u  |  auto=%u  |  fill cycles=%u\n",
                   gStats.boot_count, gConfig.boot_auto_mode, gStats.fill_cycles);
+
+    // ── I2C + MCP23017 ───────────────────────────────────────────────────────
+    Wire.begin(I2C_SDA, I2C_SCL);
+    if (!mcp.begin_I2C(MCP_I2C_ADDR)) {
+        Serial.println("[FATAL] MCP23017 not found at 0x20");
+        fill_solid(leds, NUM_LEDS, CRGB::Red); FastLED.show();
+        for (;;) vTaskDelay(portMAX_DELAY);
+    }
+    // Cap-touch buttons: TTP223 drives the line actively — no pull-up
+    for (uint8_t i = MCP_BTN_MODE; i <= MCP_BTN_POND; i++) mcp.pinMode(i, INPUT);
+    // Float switches: NC + switch to GND — enable 100 kΩ internal pull-up
+    for (uint8_t i = MCP_FLOAT_0; i <= MCP_FLOAT_2; i++) mcp.pinMode(i, INPUT_PULLUP);
 
     // ── GPIO ─────────────────────────────────────────────────────────────────
     pinMode(RELAY_P1, OUTPUT); digitalWrite(RELAY_P1, LOW);
