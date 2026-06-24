@@ -2,7 +2,7 @@
 // TANK CONTROLLER NODE (0x02)  –  Production Firmware v1.1
 // Target  : Espressif ESP32 (Xtensa LX6 Dual-Core)
 // Framework: Arduino + FreeRTOS
-// Libraries: RadioLib (SX1262), FastLED (WS2812B), Bounce2, DHT22, Preferences
+// Libraries: RadioLib (SX1262), FastLED (WS2812B), Bounce2, Preferences
 //
 // Protocol v1.1 vs v1.0:
 //   • TelemetryData gains last_rssi (int8) and last_snr (int8) — wire-breaking change
@@ -86,6 +86,13 @@
 #define NODE_POND_REMOTE  0x03
 #define NODE_BROADCAST    0xFF
 
+// ACS724LMATR-50AU-T calibration (3.3 V supply, 12-bit ADC, unidirectional 0–50 A)
+// VIOUT = 0.1×VCC + Sensitivity×I  →  at 0 A: 0.33 V → ADC raw ≈ 410
+// Sensitivity ≈ 26.4 mV/A → ≈ 32 ADC counts per ampere
+// Sensor range: 0–50 A → ADC 410–2048
+#define ACS724_ADC_ZERO     410   // raw ADC at 0 A
+#define ACS724_ADC_PER_AMP   32   // ADC counts per ampere
+
 // Fixed operational constants (not user-tunable)
 #define ADC_SAMPLES           8
 #define FLASH_RX_MS           200UL
@@ -106,8 +113,8 @@
 #define DEF_NETWORK_TIMEOUT_MS         60000UL
 #define DEF_ACK_TIMEOUT_MS            10000UL  // LoRa round-trip at 868/SF9 + margin
 #define DEF_ACK_MAX_RETRIES                5
-#define DEF_OVERCURRENT_THRESH          3200
-#define DEF_DRYRUN_THRESH                150
+#define DEF_OVERCURRENT_THRESH  (ACS724_ADC_ZERO + 40 * ACS724_ADC_PER_AMP)  // ~40 A → raw 1690
+#define DEF_DRYRUN_THRESH       (ACS724_ADC_ZERO +  2 * ACS724_ADC_PER_AMP)  //  ~2 A → raw  474
 #define DEF_BOOT_AUTO_MODE                 1
 #define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
 #define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
@@ -218,7 +225,6 @@ struct SystemState {
     bool     btnMode_edge, btnP1_edge, btnP2_edge, btnP3_edge, btnPond_edge;
     uint16_t currentP1, currentP2, currentP3;
     bool     rxFlash, txFlash;
-    uint32_t rxFlashTime_ms, txFlashTime_ms;
     int8_t   lastRssi;   // updated after each valid RX by LoRaTransceiver
     int8_t   lastSnr;
 };
@@ -320,7 +326,8 @@ static bool validateConfig(const NodeConfig &c) {
     if (c.ack_timeout_ms        < 1000UL   || c.ack_timeout_ms        > 60000UL)  return false;
     if (c.overcurrent_thresh    > 4095)                                            return false;
     if (c.dryrun_thresh         >= c.overcurrent_thresh)                           return false;
-    if (c.ack_max_retries       < 1        || c.ack_max_retries       > 10)       return false;
+    if (c.ack_max_retries        < 1        || c.ack_max_retries       > 10)       return false;
+    if (c.overcurrent_grace_ticks < 1)                                            return false;
     return true;
 }
 
@@ -376,6 +383,13 @@ static void loadConfig() {
 // SECTION 10 – SHARED HELPER FUNCTIONS
 // =============================================================================
 
+// Triangle-wave brightness oscillator: returns 0-255 with given period.
+// Uses FastLED triwave8 — rises 0→255 over first half, falls back to 0.
+// 'offset_ms' shifts the phase so multiple LEDs can breathe out of sync.
+static inline uint8_t triWave(uint32_t now_ms, uint32_t period_ms, uint32_t offset_ms = 0) {
+    return triwave8((uint8_t)(((now_ms + offset_ms) % period_ms) * 256UL / period_ms));
+}
+
 static uint16_t readCurrentADC(uint8_t pin) {
     uint32_t sum = 0;
     for (uint8_t i = 0; i < ADC_SAMPLES; i++) sum += (uint32_t)analogRead(pin);
@@ -391,22 +405,21 @@ static void buildAndQueueTelemetry() {
     pkt.header.msg_id     = nextMsgId();
     pkt.header.msg_type   = MSG_TELEMETRY;
 
-    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        uint8_t flags = 0;
-        if (gState.autoMode)  flags |= (1 << 0);
-        if (gState.relay_p1)  flags |= (1 << 1);
-        if (gState.relay_p2)  flags |= (1 << 2);
-        if (gState.relay_p3)  flags |= (1 << 3);
-        if (gState.pondPump)  flags |= (1 << 4);
-        pkt.payload.telemetry.water_level  = gState.waterLevel;
-        pkt.payload.telemetry.system_flags = flags;
-        pkt.payload.telemetry.temperature  = (int16_t)(gState.temperature * 10.0f);
-        pkt.payload.telemetry.humidity     = (uint8_t)(gState.humidity + 0.5f);
-        pkt.payload.telemetry.error_code   = gState.errorCode;
-        pkt.payload.telemetry.last_rssi    = gState.lastRssi;
-        pkt.payload.telemetry.last_snr     = gState.lastSnr;
-        xSemaphoreGive(xStateMutex);
-    }
+    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+    uint8_t flags = 0;
+    if (gState.autoMode)  flags |= (1 << 0);
+    if (gState.relay_p1)  flags |= (1 << 1);
+    if (gState.relay_p2)  flags |= (1 << 2);
+    if (gState.relay_p3)  flags |= (1 << 3);
+    if (gState.pondPump)  flags |= (1 << 4);
+    pkt.payload.telemetry.water_level  = gState.waterLevel;
+    pkt.payload.telemetry.system_flags = flags;
+    pkt.payload.telemetry.temperature  = (int16_t)(gState.temperature * 10.0f);
+    pkt.payload.telemetry.humidity     = (uint8_t)(gState.humidity + 0.5f);
+    pkt.payload.telemetry.error_code   = gState.errorCode;
+    pkt.payload.telemetry.last_rssi    = gState.lastRssi;
+    pkt.payload.telemetry.last_snr     = gState.lastSnr;
+    xSemaphoreGive(xStateMutex);
     xQueueSend(xTxQueue, &pkt, 0);
 }
 
@@ -1002,8 +1015,7 @@ static void Task_LoRaTransceiver(void *pvParams) {
             int state = radio.transmit((uint8_t *)&txPkt, (size_t)sizeof(LoRaPacket));
             if (state == RADIOLIB_ERR_NONE) {
                 if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    gState.txFlash        = true;
-                    gState.txFlashTime_ms = millis();
+                    gState.txFlash = true;
                     xSemaphoreGive(xStateMutex);
                 }
             } else {
@@ -1034,10 +1046,9 @@ static void Task_LoRaTransceiver(void *pvParams) {
 
                     if (xQueueSend(xRxQueue, pkt, 0) == pdTRUE) {
                         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                            gState.rxFlash        = true;
-                            gState.rxFlashTime_ms = millis();
-                            gState.lastRssi       = rssi;
-                            gState.lastSnr        = snr;
+                            gState.rxFlash  = true;
+                            gState.lastRssi = rssi;
+                            gState.lastSnr  = snr;
                             xSemaphoreGive(xStateMutex);
                         }
                     }
@@ -1057,26 +1068,22 @@ static void Task_LoRaTransceiver(void *pvParams) {
 // =============================================================================
 
 static void Task_UIAnimation(void *pvParams) {
-    uint8_t  pulsePhase     = 0;
     uint32_t lastRxFlash_ms = 0;
     uint32_t lastTxFlash_ms = 0;
-    uint32_t netFlashToggle = 0;
-    bool     netFlashOn     = false;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(30));
-
         uint32_t now = millis();
 
+        // ── Snapshot state ───────────────────────────────────────────────────
         uint8_t  waterLevel, errorCode;
         bool     autoMode, faultLockout, awaitingAck;
         bool     relay_p1, relay_p2, relay_p3, pondPump;
         bool     rxFlash, txFlash;
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) != pdTRUE) continue;
-
         waterLevel   = gState.waterLevel;
         autoMode     = gState.autoMode;
         faultLockout = gState.faultLockout;
@@ -1088,7 +1095,6 @@ static void Task_UIAnimation(void *pvParams) {
         pondPump     = gState.pondPump;
         rxFlash = gState.rxFlash; gState.rxFlash = false;
         txFlash = gState.txFlash; gState.txFlash = false;
-
         xSemaphoreGive(xStateMutex);
 
         if (rxFlash) lastRxFlash_ms = now;
@@ -1096,51 +1102,123 @@ static void Task_UIAnimation(void *pvParams) {
 
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // LEDs 0-2: water level (aqua fill from bottom, 3 float switches -> level 0-3)
-        for (uint8_t i = 0; i < waterLevel && i < 3; i++) leds[i] = CRGB(0, 180, 220);
+        // ── LEDs 0–2: water level ────────────────────────────────────────────
+        // Empty: slow red breathe on LED 0 (warning).
+        // Filled: aqua column, brightness rises with level, top LED shimmers.
+        // Filling (pond pump on): white sparkle chase climbs the column.
+        if (waterLevel == 0) {
+            uint8_t bri = scale8(triWave(now, 2000), 55);
+            leds[0] = CRGB(bri, 0, 0);
+        } else {
+            for (uint8_t i = 0; i < waterLevel && i < 3; i++) {
+                uint8_t base = (uint8_t)map(waterLevel, 1, 3, 100, 200);
+                leds[i] = CRGB(0, (uint8_t)(base * 7 / 10), base);
+            }
+            // Top LED gets a gentle shimmer
+            uint8_t sh  = scale8(triWave(now, 1800), 35);
+            uint8_t top = waterLevel - 1;
+            leds[top].g = qadd8(leds[top].g, sh);
+            leds[top].b = qadd8(leds[top].b, sh / 2);
+        }
+        if (pondPump) {
+            // Sparkle chases up LEDs 0→1→2 while filling
+            uint8_t slot = (uint8_t)((now / 220) % 3);
+            uint8_t bri  = scale8(triWave(now, 440), 210);
+            leds[slot] = blend(leds[slot], CRGB(bri, bri, bri), 210);
+        }
 
-        // LED 4: system status (priority order)
-        if (faultLockout || errorCode == 1 || errorCode == 2) {
-            leds[4] = CRGB::Red;
+        // ── LED 3: heartbeat ─────────────────────────────────────────────────
+        // Lub-dub pulse every 1.6 s — confirms controller is alive.
+        {
+            uint32_t ph = now % 1600UL;
+            uint8_t  hb = 0;
+            if      (ph <  100) hb = (uint8_t)(ph * 2);
+            else if (ph <  200) hb = (uint8_t)((200 - ph) * 2);
+            else if (ph <  300) hb = (uint8_t)((ph - 200) * 2);
+            else if (ph <  400) hb = (uint8_t)((400 - ph) * 2);
+            hb = scale8(hb, 80);
+            leds[3] = CRGB(hb, hb / 3, 0);   // warm amber
+        }
+
+        // ── LED 4: system status ─────────────────────────────────────────────
+        if (faultLockout) {
+            // Hard lockout: rapid red strobe ~8 Hz
+            leds[4] = ((now / 62) & 1) ? CRGB(255, 0, 0) : CRGB::Black;
+
+        } else if (errorCode == 1 || errorCode == 2) {
+            // OC / dry-run warning: slow red breathe
+            uint8_t bri = scale8(triWave(now, 900), 220) + 30;
+            leds[4] = CRGB(bri, 0, 0);
 
         } else if (errorCode == 3) {
-            if ((now - netFlashToggle) >= FLASH_NET_MS) {
-                netFlashToggle = now;
-                netFlashOn     = !netFlashOn;
-            }
-            leds[4] = netFlashOn ? CRGB::Red : CRGB::Black;
+            // Network timeout: orange breathe
+            uint8_t bri = scale8(triWave(now, 1200), 200) + 30;
+            leds[4] = CRGB(bri, bri / 4, 0);
 
         } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
-            leds[4] = CRGB(148, 0, 211);   // purple - RX
+            // RX received: purple flash that fades out
+            uint8_t fade = (uint8_t)(255 - (now - lastRxFlash_ms) * 255UL / FLASH_RX_MS);
+            leds[4] = CRGB(scale8(148, fade), 0, scale8(211, fade));
 
         } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
-            leds[4] = CRGB::Cyan;           // TX
+            // TX sent: white flash that fades out
+            uint8_t fade = (uint8_t)(255 - (now - lastTxFlash_ms) * 255UL / FLASH_TX_MS);
+            leds[4] = CRGB(fade, fade, fade);
 
         } else if (awaitingAck) {
-            // Triangle-wave pulse yellow
-            pulsePhase = (uint8_t)((pulsePhase + 10) & 0xFF);
-            uint8_t bri = (pulsePhase < 128)
-                          ? (uint8_t)(pulsePhase * 2)
-                          : (uint8_t)((255 - pulsePhase) * 2);
+            // Waiting for pond ACK: fast yellow pulse
+            uint8_t bri = scale8(triWave(now, 400), 230) + 20;
             leds[4] = CRGB(bri, bri, 0);
 
         } else if (autoMode) {
-            leds[4] = CRGB::Green;
+            // Auto idle: slow breathing green
+            uint8_t bri = scale8(triWave(now, 2500), 190) + 40;
+            leds[4] = CRGB(0, bri, 0);
 
         } else {
-            leds[4] = CRGB::Blue;
+            // Manual idle: slow breathing blue
+            uint8_t bri = scale8(triWave(now, 2500), 180) + 40;
+            leds[4] = CRGB(0, 0, bri);
         }
 
-        // LED 5: mode indicator
-        leds[5] = autoMode ? CRGB::Green : CRGB::Blue;
+        // ── LED 5: mode indicator ────────────────────────────────────────────
+        // Breathes in complementary phase to LED 4; red when faulted.
+        if (faultLockout || errorCode == 1 || errorCode == 2) {
+            uint8_t bri = scale8(triWave(now, 900, 450), 140);
+            leds[5] = CRGB(bri, 0, 0);
+        } else if (autoMode) {
+            uint8_t bri = scale8(triWave(now, 2500, 1250), 160) + 30;
+            leds[5] = CRGB(0, bri, 0);
+        } else {
+            uint8_t bri = scale8(triWave(now, 2500, 1250), 150) + 30;
+            leds[5] = CRGB(0, 0, bri);
+        }
 
-        // LEDs 6-8: local relay states
-        leds[6] = relay_p1 ? CRGB::Green : CRGB(30, 0, 0);
-        leds[7] = relay_p2 ? CRGB::Green : CRGB(30, 0, 0);
-        leds[8] = relay_p3 ? CRGB::Green : CRGB(30, 0, 0);
+        // ── LEDs 6–8: local pump relays P1 / P2 / P3 ────────────────────────
+        // ON  → bright green with occasional white sparkle.
+        // OFF → very dim blue-grey idle breathe, staggered phases.
+        const bool     relayOn[3]    = { relay_p1, relay_p2, relay_p3 };
+        const uint32_t idleOff[3]    = { 0, 1100, 2200 };
+        for (uint8_t i = 0; i < 3; i++) {
+            if (relayOn[i]) {
+                uint8_t sp = (random8() > 250) ? random8(50, 150) : 0;
+                leds[6 + i] = CRGB(sp, qadd8(195, sp / 3), sp);
+            } else {
+                uint8_t bri = scale8(triWave(now, 3500, idleOff[i]), 16);
+                leds[6 + i] = CRGB(bri / 4, bri / 4, bri);
+            }
+        }
 
-        // LED 9: remote pond pump
-        leds[9] = pondPump ? CRGB::Cyan : CRGB(0, 0, 30);
+        // ── LED 9: remote pond pump ──────────────────────────────────────────
+        // ON  → bright cyan with slow shimmer.
+        // OFF → dim teal idle breathe.
+        if (pondPump) {
+            uint8_t sh = scale8(triWave(now, 900), 50);
+            leds[9] = CRGB(0, qadd8(150, sh), qadd8(180, sh));
+        } else {
+            uint8_t bri = scale8(triWave(now, 4000, 700), 20);
+            leds[9] = CRGB(0, bri / 2, bri);
+        }
 
         FastLED.show();
     }
