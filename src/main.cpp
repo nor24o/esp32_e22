@@ -45,7 +45,7 @@
 #define LORA_MISO  19
 #define LORA_MOSI  23
 
-#define WS2812B_PIN  12
+#define WS2812B_PIN  12   // ⚠ strapping pin (MTDI) — data line must be LOW at power-on
 #define NUM_LEDS     10
 
 // I2C bus (shared by MCP23017)
@@ -74,7 +74,7 @@
 
 #define CURRENT_P1_ADC  4   // ADC2_CH0
 #define CURRENT_P2_ADC  39  // ADC1_CH3 – input-only, safe
-#define CURRENT_P3_ADC  2   // ADC2_CH2
+#define CURRENT_P3_ADC  2   // ADC2_CH2  ⚠ strapping pin — sensor out must be <0.6V at boot
 
 // =============================================================================
 // SECTION 2 – COMPILE-TIME CONSTANTS AND DEFAULTS
@@ -114,7 +114,7 @@
 #define NVS_NAMESPACE    "tanknode"
 #define NVS_CFG_VER_KEY  "cfgver"
 #define NVS_CFG_KEY      "cfg"
-#define CONFIG_VERSION   2  // bumped: overcurrent_grace_ticks + fault_lockout_enabled added
+#define CONFIG_VERSION   3  // bumped: dryrun_grace_ticks added
 
 // Defaults for NodeConfig (applied on first boot or after version mismatch)
 #define DEF_PUMP_MIN_RUNTIME_MS        30000UL
@@ -128,6 +128,7 @@
 #define DEF_DRYRUN_THRESH       (ACS724_ADC_ZERO +  2 * ACS724_ADC_PER_AMP)  //  ~2 A → raw  474
 #define DEF_BOOT_AUTO_MODE                 1
 #define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
+#define DEF_DRYRUN_GRACE_TICKS            15   // 15 × 50 ms = 750 ms — air bubbles cause transient dips
 #define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
 
 // Capacitive touch button polarity
@@ -186,9 +187,10 @@ struct __attribute__((packed)) NodeConfig {
     uint16_t dryrun_thresh;          //  2   default 150
     uint8_t  ack_max_retries;          //  1   default 5
     uint8_t  boot_auto_mode;           //  1   1=auto 0=manual
-    uint8_t  overcurrent_grace_ticks;  //  1   consecutive 50ms ticks before fault trips (0=immediate)
+    uint8_t  overcurrent_grace_ticks;  //  1   consecutive 50ms ticks before OC fault trips
     uint8_t  fault_lockout_enabled;    //  1   1=kill relays + lockout  0=warn only (no relay cut)
-};  // 32 bytes
+    uint8_t  dryrun_grace_ticks;       //  1   consecutive 50ms ticks before dry-run fault trips
+};  // 33 bytes
 
 // Operational statistics — persisted in NVS, queryable over LoRa
 struct __attribute__((packed)) StatsPayload {
@@ -208,13 +210,13 @@ struct __attribute__((packed)) LoRaPacket {
     union {
         TelemetryData telemetry;   //  8
         CommandData   command;      //  3
-        NodeConfig    config;       // 32
+        NodeConfig    config;       // 33
         StatsPayload  stats;        // 32
-    } payload;           // 32 bytes (largest member)
-};  // total 38 bytes
+    } payload;           // 33 bytes (largest member)
+};  // total 39 bytes
 
 static_assert(sizeof(LoRaPacket)   <= 255, "LoRaPacket exceeds max RadioLib payload");
-static_assert(sizeof(NodeConfig)   == 32,  "NodeConfig size mismatch");
+static_assert(sizeof(NodeConfig)   == 33,  "NodeConfig size mismatch");
 static_assert(sizeof(StatsPayload) == 32,  "StatsPayload size mismatch");
 
 // =============================================================================
@@ -324,6 +326,7 @@ static void resetConfigToDefaults() {
     gConfig.boot_auto_mode           = DEF_BOOT_AUTO_MODE;
     gConfig.overcurrent_grace_ticks  = DEF_OVERCURRENT_GRACE_TICKS;
     gConfig.fault_lockout_enabled    = DEF_FAULT_LOCKOUT_ENABLED;
+    gConfig.dryrun_grace_ticks       = DEF_DRYRUN_GRACE_TICKS;
 }
 
 // Sanity-check incoming config before applying it.
@@ -338,6 +341,7 @@ static bool validateConfig(const NodeConfig &c) {
     if (c.dryrun_thresh         >= c.overcurrent_thresh)                           return false;
     if (c.ack_max_retries        < 1        || c.ack_max_retries       > 10)       return false;
     if (c.overcurrent_grace_ticks < 1)                                            return false;
+    if (c.dryrun_grace_ticks < 1)                                                 return false;
     return true;
 }
 
@@ -560,6 +564,8 @@ static void Task_InputSensorPoll(void *pvParams) {
         db[i] = { true, true, 0, (i < 5) ? (uint8_t)1 : (uint8_t)100 };
     }
 
+    uint8_t mcpErrCount = 0;  // consecutive suspicious reads (I2C bus error guard)
+
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
     for (;;) {
@@ -567,6 +573,15 @@ static void Task_InputSensorPoll(void *pvParams) {
 
         // Read all 8 GPA pins in one I2C transaction
         uint8_t port = mcp.readGPIOA();
+
+        // All 5 button lines simultaneously LOW is physically impossible with 5 independent
+        // TTP223 modules. readGPIOA() returns 0x00 on I2C bus error — skip the tick to
+        // avoid injecting garbage state (all buttons pressed + tank empty signal).
+        if ((port & 0x1F) == 0x00) {
+            if (++mcpErrCount >= 3) continue;  // 3 bad reads in a row → skip
+        } else {
+            mcpErrCount = 0;
+        }
 
         bool fell[8] = {};   // HIGH→LOW transition confirmed this tick
         bool rose[8] = {};   // LOW→HIGH transition confirmed this tick
@@ -641,6 +656,9 @@ static void Task_ControlEngine(void *pvParams) {
     bool     replenishActive    = false;
     uint32_t replenishStartTime = 0;
 
+    bool     statsDirty       = false;   // true when gStats has unsaved changes
+    uint32_t lastStatsSave_ms = 0;       // throttles NVS flash writes to ≤1 per 5 min
+
     bool     awaitingAckInternal = false;
     uint32_t ackSentTime_ms      = 0;
     uint8_t  ackRetryCount       = 0;
@@ -655,7 +673,7 @@ static void Task_ControlEngine(void *pvParams) {
 
         uint32_t now = millis();
 
-        // ── Snapshot global state ───────────────────────────────────────────
+        // ── Snapshot global state ─────────────────────────────────────
         uint8_t  waterLevel, errorCode;
         bool     autoMode, faultLockout;
         uint16_t curP1, curP2, curP3;
@@ -681,7 +699,7 @@ static void Task_ControlEngine(void *pvParams) {
 
         xSemaphoreGive(xStateMutex);
 
-        // ── Overcurrent / dry-run protection (inrush grace period) ───────────────
+        // ── Overcurrent / dry-run protection (inrush grace period) ──────────────────
         // Grace counters accumulate consecutive 50 ms ticks above/below threshold.
         // A fault only triggers after overcurrent_grace_ticks consecutive detections
         // (default 5 = 250 ms), filtering inrush spikes.  When fault_lockout_enabled=0
@@ -700,7 +718,7 @@ static void Task_ControlEngine(void *pvParams) {
                         if (drGrace[i] < 255) drGrace[i]++;
                     } else { drGrace[i] = 0; }
                     if (ocGrace[i] >= gConfig.overcurrent_grace_ticks) overCurrent = true;
-                    if (drGrace[i] >= gConfig.overcurrent_grace_ticks) dryRun      = true;
+                    if (drGrace[i] >= gConfig.dryrun_grace_ticks)      dryRun      = true;
                 } else {
                     ocGrace[i] = drGrace[i] = 0;
                 }
@@ -741,7 +759,7 @@ static void Task_ControlEngine(void *pvParams) {
             }
         }
 
-        // ── Fault-lockout gate ────────────────────────────────────────────────
+        // ── Fault-lockout gate ──────────────────────────────────────────
         if (faultLockout) {
             if (btnMode) {
                 if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -762,11 +780,11 @@ static void Task_ControlEngine(void *pvParams) {
             continue;
         }
 
-        // ── Network-timeout assessment ───────────────────────────────────────
+        // ── Network-timeout assessment ───────────────────────────────────
         bool networkOk = ((now - lastGateway) < gConfig.network_timeout_ms) &&
                          ((now - lastPond)    < gConfig.network_timeout_ms);
 
-        // ── Mode toggle ──────────────────────────────────────────────────────
+        // ── Mode toggle ────────────────────────────────────────────
         if (btnMode) {
             autoMode = !autoMode;
             if (!autoMode && replenishActive) replenishActive = false;
@@ -778,7 +796,7 @@ static void Task_ControlEngine(void *pvParams) {
             }
         }
 
-        // ── Process received LoRa packets ────────────────────────────────────
+        // ── Process received LoRa packets ──────────────────────────────────
         LoRaPacket rxPkt;
         while (xQueueReceive(xRxQueue, &rxPkt, 0) == pdTRUE) {
 
@@ -800,7 +818,7 @@ static void Task_ControlEngine(void *pvParams) {
                         } else if (cmd.action == 0 && canTurnPumpOff(ph_p1)) {
                             gStats.runtime_p1_s += trackPumpOff(onSince_p1);
                             setPumpState(ph_p1, false, RELAY_P1);
-                            saveStats();
+                            statsDirty = true;
                         }
                         break;
                     case 2:
@@ -810,7 +828,7 @@ static void Task_ControlEngine(void *pvParams) {
                         } else if (cmd.action == 0 && canTurnPumpOff(ph_p2)) {
                             gStats.runtime_p2_s += trackPumpOff(onSince_p2);
                             setPumpState(ph_p2, false, RELAY_P2);
-                            saveStats();
+                            statsDirty = true;
                         }
                         break;
                     case 3:
@@ -820,7 +838,7 @@ static void Task_ControlEngine(void *pvParams) {
                         } else if (cmd.action == 0 && canTurnPumpOff(ph_p3)) {
                             gStats.runtime_p3_s += trackPumpOff(onSince_p3);
                             setPumpState(ph_p3, false, RELAY_P3);
-                            saveStats();
+                            statsDirty = true;
                         }
                         break;
                     default: break;
@@ -886,7 +904,7 @@ static void Task_ControlEngine(void *pvParams) {
             }
         }
 
-        // ── ACK timeout / retry ──────────────────────────────────────────────
+        // ── ACK timeout / retry ──────────────────────────────────────────
         if (awaitingAckInternal && (now - ackSentTime_ms) >= gConfig.ack_timeout_ms) {
             if (ackRetryCount < gConfig.ack_max_retries) {
                 ackRetryCount++;
@@ -903,7 +921,7 @@ static void Task_ControlEngine(void *pvParams) {
             }
         }
 
-        // ── Network-timeout error field ──────────────────────────────────────
+        // ── Network-timeout error field ──────────────────────────────────
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             if (!networkOk && gState.errorCode == 0) gState.errorCode = 3;
             if ( networkOk && gState.errorCode == 3) gState.errorCode = 0;
@@ -919,7 +937,7 @@ static void Task_ControlEngine(void *pvParams) {
                     replenishActive    = true;
                     replenishStartTime = now;
                     gStats.fill_cycles++;
-                    saveStats();  // record fill cycle start; leak-detection counter
+                    statsDirty = true;  // fill_cycles is a leak-detection counter — flush soon
                     setPumpState(ph_pond, true, -1);
                     trackPumpOn(onSince_pond);
                     pendingPondAction   = 1;
@@ -939,7 +957,7 @@ static void Task_ControlEngine(void *pvParams) {
                     replenishActive = false;
                     gStats.runtime_pond_s += trackPumpOff(onSince_pond);
                     setPumpState(ph_pond, false, -1);
-                    saveStats();
+                    statsDirty = true;
                     pendingPondAction   = 0;
                     awaitingAckInternal = true;
                     ackSentTime_ms      = now;
@@ -966,7 +984,7 @@ static void Task_ControlEngine(void *pvParams) {
                 } else if (!want && canTurnPumpOff(ph_p1)) {
                     gStats.runtime_p1_s += trackPumpOff(onSince_p1);
                     setPumpState(ph_p1, false, RELAY_P1);
-                    saveStats();
+                    statsDirty = true;
                 }
             }
             if (btnP2) {
@@ -977,7 +995,7 @@ static void Task_ControlEngine(void *pvParams) {
                 } else if (!want && canTurnPumpOff(ph_p2)) {
                     gStats.runtime_p2_s += trackPumpOff(onSince_p2);
                     setPumpState(ph_p2, false, RELAY_P2);
-                    saveStats();
+                    statsDirty = true;
                 }
             }
             if (btnP3) {
@@ -988,7 +1006,7 @@ static void Task_ControlEngine(void *pvParams) {
                 } else if (!want && canTurnPumpOff(ph_p3)) {
                     gStats.runtime_p3_s += trackPumpOff(onSince_p3);
                     setPumpState(ph_p3, false, RELAY_P3);
-                    saveStats();
+                    statsDirty = true;
                 }
             }
             if (btnPond) {
@@ -1009,7 +1027,7 @@ static void Task_ControlEngine(void *pvParams) {
                 } else if (!want && canTurnPumpOff(ph_pond)) {
                     gStats.runtime_pond_s += trackPumpOff(onSince_pond);
                     setPumpState(ph_pond, false, -1);
-                    saveStats();
+                    statsDirty = true;
                     pendingPondAction   = 0;
                     awaitingAckInternal = true;
                     ackSentTime_ms      = now;
@@ -1024,7 +1042,7 @@ static void Task_ControlEngine(void *pvParams) {
             }
         }
 
-        // ── Push relay states ────────────────────────────────────────────────
+        // ── Push relay states ────────────────────────────────────────────
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             gState.relay_p1 = ph_p1.state;
             gState.relay_p2 = ph_p2.state;
@@ -1033,7 +1051,14 @@ static void Task_ControlEngine(void *pvParams) {
             xSemaphoreGive(xStateMutex);
         }
 
-        // ── Periodic telemetry ───────────────────────────────────────────────
+        // ── Periodic NVS stats flush (max once per 5 min) ───────────────────
+        if (statsDirty && (now - lastStatsSave_ms) >= 300000UL) {
+            saveStats();
+            statsDirty        = false;
+            lastStatsSave_ms  = now;
+        }
+
+        // ── Periodic telemetry ───────────────────────────────────────────
         if ((now - lastTelemetryTime_ms) >= gConfig.telemetry_interval_ms) {
             lastTelemetryTime_ms = now;
             buildAndQueueTelemetry();
@@ -1117,7 +1142,7 @@ static void Task_UIAnimation(void *pvParams) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(30));
         uint32_t now = millis();
 
-        // ── Snapshot state ───────────────────────────────────────────────────
+        // ── Snapshot state ───────────────────────────────────────────────
         uint8_t  waterLevel, errorCode;
         bool     autoMode, faultLockout, awaitingAck;
         bool     relay_p1, relay_p2, relay_p3, pondPump;
@@ -1142,7 +1167,7 @@ static void Task_UIAnimation(void *pvParams) {
 
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // ── LEDs 0–2: water level ────────────────────────────────────────────
+        // ── LEDs 0–2: water level ────────────────────────────────────────
         // Empty: slow red breathe on LED 0 (warning).
         // Filled: aqua column, brightness rises with level, top LED shimmers.
         // Filling (pond pump on): white sparkle chase climbs the column.
@@ -1167,7 +1192,7 @@ static void Task_UIAnimation(void *pvParams) {
             leds[slot] = blend(leds[slot], CRGB(bri, bri, bri), 210);
         }
 
-        // ── LED 3: heartbeat ─────────────────────────────────────────────────
+        // ── LED 3: heartbeat ───────────────────────────────────────────────
         // Lub-dub pulse every 1.6 s — confirms controller is alive.
         {
             uint32_t ph = now % 1600UL;
@@ -1221,7 +1246,7 @@ static void Task_UIAnimation(void *pvParams) {
             leds[4] = CRGB(0, 0, bri);
         }
 
-        // ── LED 5: mode indicator ────────────────────────────────────────────
+        // ── LED 5: mode indicator ──────────────────────────────────────────
         // Breathes in complementary phase to LED 4; red when faulted.
         if (faultLockout || errorCode == 1 || errorCode == 2) {
             uint8_t bri = scale8(triWave(now, 900, 450), 140);
@@ -1284,7 +1309,7 @@ void setup() {
     Serial.printf("[BOOT] Boot #%u  |  auto=%u  |  fill cycles=%u\n",
                   gStats.boot_count, gConfig.boot_auto_mode, gStats.fill_cycles);
 
-    // ── I2C + MCP23017 ───────────────────────────────────────────────────────
+    // ── I2C + MCP23017 ────────────────────────────────────────────────
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!mcp.begin_I2C(MCP_I2C_ADDR)) {
         Serial.println("[FATAL] MCP23017 not found at 0x20");
@@ -1304,7 +1329,7 @@ void setup() {
     analogSetWidth(12);
     analogSetAttenuation(ADC_11db);
 
-    // ── FastLED ───────────────────────────────────────────────────────────────
+    // ── FastLED ──────────────────────────────────────────────────────────────────
     FastLED.addLeds<WS2812B, WS2812B_PIN, GRB>(leds, NUM_LEDS);
     FastLED.setBrightness(80);
     fill_solid(leds, NUM_LEDS, CRGB::Black);
@@ -1329,7 +1354,7 @@ void setup() {
     xRxQueue = xQueueCreate(8, sizeof(LoRaPacket));
     configASSERT(xRxQueue != nullptr);
 
-    // ── RadioLib SX1262 ───────────────────────────────────────────────────────
+    // ── RadioLib SX1262 ─────────────────────────────────────────────────────
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
 
     int radioState = radio.begin(
@@ -1355,7 +1380,7 @@ void setup() {
     Serial.printf("[BOOT] Radio OK  |  Packet size: %u bytes\n",
                   (unsigned)sizeof(LoRaPacket));
 
-    // ── FreeRTOS tasks ────────────────────────────────────────────────────────
+    // ── FreeRTOS tasks ─────────────────────────────────────────────────────────
     BaseType_t rc;
 
     // Priority scheme: pump control is most critical, LoRa is secondary.
