@@ -9,7 +9,7 @@
 
 static void Task_InputSensorPoll(void *pvParams) {
     const uint8_t curPins[3] = { CURRENT_P1_ADC, CURRENT_P2_ADC, CURRENT_P3_ADC };
-    uint8_t  prevBits        = 0xFF;
+    uint8_t  prevBits        = 0x07;  // P0-P2 float idle HIGH, P3-P7 TTP223 idle LOW
     uint32_t pcfRetryAt_ms   = 0;  // millis() timestamp for next PCF re-init attempt
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -27,14 +27,18 @@ static void Task_InputSensorPoll(void *pvParams) {
                 xSemaphoreGive(xI2cMutex);
                 if (ok) {
                     gPcfOk = true;
-                    prevBits = 0xFF;
-                    Serial.println("\n[PCF] PCF8574 detected — float switch and button inputs enabled");
+                    prevBits = 0x07;  // P0-P2 float idle HIGH, P3-P7 TTP223 idle LOW
+                    Serial.println("\n[PCF] PCF8574 detected — float switches (P0-P2) and TTP223 touch modules (P3-P7) enabled");
                 }
             }
         }
 
-        // Read all 8 PCF8574 pins in one I2C transaction (skipped if not present)
-        uint8_t currBits = 0xFF;  // safe default: all HIGH → no water, no button presses
+        // Read all 8 PCF8574 pins in one I2C transaction (skipped if not present).
+        // Safe defaults keep float switches as "no water" and TTP223 as "not touched".
+        //   P0-P2 float switches idle HIGH (open), water present = LOW
+        //   P3-P7 TTP223 default idle LOW, touched = HIGH  (TTP223_TOUCHED_LEVEL == 1)
+        uint8_t currBits = 0x00;  // safe default for TTP223 active-HIGH: all LOW = nothing touched
+        currBits |= 0x07;         // P0-P2 float switches: idle HIGH = no water
         if (gPcfOk && xSemaphoreTake(xI2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             Wire.requestFrom((uint8_t)PCF8574_ADDR, (uint8_t)1);
             if (Wire.available() >= 1) {
@@ -43,11 +47,19 @@ static void Task_InputSensorPoll(void *pvParams) {
             xSemaphoreGive(xI2cMutex);
         }
 
-        // Falling-edge mask: bits that transitioned HIGH→LOW this tick (active-low press)
-        uint8_t fell = prevBits & ~currBits;
+        // Float switches (P0-P2): falling edge = water level rose (float closed, pin LOW)
+        // TTP223 touch (P3-P7):   rising edge  = touched (TTP223 output went HIGH)
+        // Each mask is a single-bit set for bits that changed in the active direction.
+#if TTP223_TOUCHED_LEVEL == 1
+        // Active-HIGH TTP223 (default): detect LOW→HIGH transition on touch pins
+        uint8_t touchEdge = ~prevBits & currBits & 0xF8;  // bits 3-7 only
+#else
+        // Active-LOW TTP223 (A-pad bridged): detect HIGH→LOW transition on touch pins
+        uint8_t touchEdge = prevBits & ~currBits & 0xF8;
+#endif
         prevBits = currBits;
 
-        // Water level: count consecutive LOW float bits from bit 0 upward
+        // Water level: count consecutive LOW float bits (P0-P2) from bit 0 upward
         uint8_t level = 0;
         for (uint8_t i = 0; i < 3; i++) {
             if ((currBits & (1u << i)) == 0) level = (uint8_t)(i + 1);
@@ -63,11 +75,11 @@ static void Task_InputSensorPoll(void *pvParams) {
             gState.currentP1  = cur[0];
             gState.currentP2  = cur[1];
             gState.currentP3  = cur[2];
-            if (fell & (1u << PCF_BTN_MODE)) gState.btnMode_edge = true;
-            if (fell & (1u << PCF_BTN_P1))   gState.btnP1_edge   = true;
-            if (fell & (1u << PCF_BTN_P2))   gState.btnP2_edge   = true;
-            if (fell & (1u << PCF_BTN_P3))   gState.btnP3_edge   = true;
-            if (fell & (1u << PCF_BTN_POND))  gState.btnPond_edge  = true;
+            if (touchEdge & (1u << PCF_TOUCH_MODE)) gState.btnMode_edge = true;
+            if (touchEdge & (1u << PCF_TOUCH_P1))   gState.btnP1_edge   = true;
+            if (touchEdge & (1u << PCF_TOUCH_P2))   gState.btnP2_edge   = true;
+            if (touchEdge & (1u << PCF_TOUCH_P3))   gState.btnP3_edge   = true;
+            if (touchEdge & (1u << PCF_TOUCH_POND))  gState.btnPond_edge  = true;
             xSemaphoreGive(xStateMutex);
         }
     }

@@ -22,20 +22,42 @@
 #define WS2812B_PIN  48
 #define NUM_LEDS     10
 
-// I2C bus for PCF8574 I/O expander (float switches + buttons)
+// I2C bus for PCF8574 I/O expander
+//   P0–P2 : vertical float switches (mechanical reed, active-low — closed = LOW)
+//   P3–P7 : TTP223 capacitive touch modules
+// All 8 pins are written 0xFF (inputs with internal quasi-bidirectional pull-ups).
 #define I2C_SDA  1
 #define I2C_SCL  2
 
-// PCF8574 address and bit assignments (8-bit, all inputs, active-low with pull-ups)
+// PCF8574 I/O expander — address and pin assignments
 #define PCF8574_ADDR  0x27
-#define PCF_FLOAT_0   0
-#define PCF_FLOAT_1   1
-#define PCF_FLOAT_2   2
-#define PCF_BTN_MODE  3
-#define PCF_BTN_P1    4
-#define PCF_BTN_P2    5
-#define PCF_BTN_P3    6
-#define PCF_BTN_POND  7
+
+// Float switch inputs (P0–P2): switch closed (water present) pulls pin LOW
+#define PCF_FLOAT_0   0  // lowest float switch  (level ≥ 1)
+#define PCF_FLOAT_1   1  // middle float switch   (level ≥ 2)
+#define PCF_FLOAT_2   2  // upper float switch    (level = 3 / full)
+
+// TTP223 capacitive touch module inputs (P3–P7)
+// TTP223 default wiring (A-pad open, B-pad open):
+//   idle (not touched) → output LOW  → PCF pin LOW
+//   touched            → output HIGH → PCF pin HIGH
+// We detect the rising edge (LOW→HIGH) as a touch event.
+// If your TTP223 modules have the A-pad bridged (active-LOW mode) flip
+// TTP223_TOUCHED_LEVEL to 0 and update the edge detection in task_input_sensor.hpp.
+#define TTP223_TOUCHED_LEVEL  1   // 1 = active-HIGH (default), 0 = active-LOW (A-pad bridged)
+
+#define PCF_TOUCH_MODE  3  // MODE toggle button
+#define PCF_TOUCH_P1    4  // Pump 1 manual toggle
+#define PCF_TOUCH_P2    5  // Pump 2 manual toggle
+#define PCF_TOUCH_P3    6  // Pump 3 manual toggle
+#define PCF_TOUCH_POND  7  // Pond pump manual toggle
+
+// Legacy aliases — kept so existing code compiles without renaming every reference
+#define PCF_BTN_MODE  PCF_TOUCH_MODE
+#define PCF_BTN_P1    PCF_TOUCH_P1
+#define PCF_BTN_P2    PCF_TOUCH_P2
+#define PCF_BTN_P3    PCF_TOUCH_P3
+#define PCF_BTN_POND  PCF_TOUCH_POND
 
 // Relay and buzzer outputs (native GPIO, active-low: LOW=ON, HIGH=OFF)
 #define RELAY_P1    47

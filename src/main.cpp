@@ -123,8 +123,8 @@ void setup() {
     gPcfOk = (Wire.endTransmission() == 0);
     Serial.printf("[INIT] PCF8574 I2C: SDA=GPIO%d  SCL=GPIO%d  addr=0x%02X  %s\n",
                   I2C_SDA, I2C_SCL, PCF8574_ADDR,
-                  gPcfOk ? "OK — float switches on bits 0-2, buttons on bits 3-7"
-                         : "not found — float switch and button inputs disabled");
+                  gPcfOk ? "OK — float switches P0-P2, TTP223 touch modules P3-P7"
+                         : "not found — float switches and TTP223 touch inputs disabled");
 
     // ── FastLED ───────────────────────────────────────────────────────────────
     Serial.printf("[INIT] WS2812B: GPIO%d  %d LEDs\n", WS2812B_PIN, NUM_LEDS);
