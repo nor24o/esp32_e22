@@ -94,16 +94,6 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .pump-dot span { position: absolute; top: 13px; left: -3px; font-size: 10px; color: var(--tx2); white-space: nowrap; }
 
   /* ── Controls ── */
-  .role-tabs { display: flex; gap: 0; margin-bottom: 12px; }
-  .role-tab {
-    flex: 1; padding: 6px; text-align: center; cursor: pointer;
-    border: 1px solid var(--bd); font-size: 12px; font-weight: 600;
-    color: var(--tx2); background: transparent; transition: background .15s;
-  }
-  .role-tab:first-child { border-radius: 6px 0 0 6px; }
-  .role-tab:last-child  { border-radius: 0 6px 6px 0; border-left: none; }
-  .role-tab.active { background: #1f6feb33; color: var(--blue); border-color: #1f6feb66; }
-
   .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
   .btn {
     padding: 7px 10px; border-radius: 6px; border: 1px solid var(--bd);
@@ -153,6 +143,22 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .chip.ok  { background: #3fb95022; color: var(--green); }
   .chip.err { background: #f8514922; color: var(--red);   }
   .chip.unk { background: #30363d;   color: var(--tx2);   }
+
+  /* ── Config form ── */
+  .cfg-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--bd); }
+  .cfg-row:last-child { border-bottom: none; }
+  .cfg-name { flex: 1; font-size: 12px; color: var(--tx2); }
+  .cfg-inp {
+    width: 80px; padding: 3px 6px;
+    background: var(--bg); border: 1px solid var(--bd); border-radius: 4px;
+    color: var(--tx); font-size: 12px; text-align: right;
+  }
+  .cfg-inp:focus { outline: none; border-color: var(--blue); }
+  .cfg-inp.dirty { border-color: var(--yel); color: var(--yel); }
+  .cfg-unit { font-size: 11px; color: var(--tx2); width: 14px; }
+  .cfg-hint { font-size: 10px; color: var(--tx2); white-space: nowrap; min-width: 64px; text-align: right; }
+  .cfg-bar  { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .cfg-status { font-size: 11px; color: var(--tx2); }
 </style>
 </head>
 <body>
@@ -160,7 +166,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <header>
   <div class="ws-dot" id="wsDot"></div>
   <h1>LoRa Tank Monitor</h1>
-  <span class="badge badge-role" id="roleBadge">GATEWAY</span>
+  <span class="badge badge-role" id="roleBadge">DUAL</span>
   <span class="badge badge-err"  id="errBadge">ERR</span>
   <span class="hdr-stat">RSSI&nbsp;<strong id="hdrRssi">—</strong>&nbsp;dBm</span>
   <span class="hdr-stat">SNR&nbsp;<strong id="hdrSnr">—</strong>&nbsp;dB</span>
@@ -219,41 +225,42 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <!-- ── Controls ── -->
   <div class="card">
     <h2>Controls</h2>
-    <div class="role-tabs">
-      <button class="role-tab active" id="tabGw"   onclick="setRole('gateway')">GATEWAY</button>
-      <button class="role-tab"        id="tabPond" onclick="setRole('pond')">POND NODE</button>
+
+    <div class="section-label">Pump Commands <span style="font-weight:400;text-transform:none;letter-spacing:0">(gateway 0x01 · force-override)</span></div>
+    <div class="btn-grid">
+      <button class="btn on"  onclick="sendCmd('pump','p=1&a=1')">P1 ON</button>
+      <button class="btn off" onclick="sendCmd('pump','p=1&a=0')">P1 OFF</button>
+      <button class="btn on"  onclick="sendCmd('pump','p=2&a=1')">P2 ON</button>
+      <button class="btn off" onclick="sendCmd('pump','p=2&a=0')">P2 OFF</button>
+      <button class="btn on"  onclick="sendCmd('pump','p=3&a=1')">P3 ON</button>
+      <button class="btn off" onclick="sendCmd('pump','p=3&a=0')">P3 OFF</button>
+      <button class="btn on"  onclick="sendCmd('pump','p=4&a=1')">Pond ON</button>
+      <button class="btn off" onclick="sendCmd('pump','p=4&a=0')">Pond OFF</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn act" onclick="sendCmd('cfg_get','')">Get Config</button>
+      <button class="btn act" onclick="sendCmd('stats_get','')">Get Stats</button>
+      <button class="btn act" onclick="sendCmd('keepalive','')">Keepalive</button>
     </div>
 
-    <!-- Gateway section -->
-    <div id="gwSection">
-      <div class="section-label">Pump Commands (force-override)</div>
-      <div class="btn-grid">
-        <button class="btn on"  onclick="sendCmd('pump','p=1&a=1')">P1 ON</button>
-        <button class="btn off" onclick="sendCmd('pump','p=1&a=0')">P1 OFF</button>
-        <button class="btn on"  onclick="sendCmd('pump','p=2&a=1')">P2 ON</button>
-        <button class="btn off" onclick="sendCmd('pump','p=2&a=0')">P2 OFF</button>
-        <button class="btn on"  onclick="sendCmd('pump','p=3&a=1')">P3 ON</button>
-        <button class="btn off" onclick="sendCmd('pump','p=3&a=0')">P3 OFF</button>
-      </div>
-      <div class="btn-row">
-        <button class="btn act" onclick="sendCmd('cfg_get','')">Get Config</button>
-        <button class="btn act" onclick="sendCmd('stats_get','')">Get Stats</button>
-        <button class="btn act" onclick="sendCmd('keepalive','')">Keepalive</button>
-      </div>
-    </div>
-
-    <!-- Pond section -->
-    <div id="pondSection" style="display:none">
-      <div class="pond-state">Pond pump state: <span id="pondPumpState">OFF</span></div>
-      <button class="btn act" onclick="sendCmd('telemetry','')" style="width:100%">Send Telemetry Now</button>
-      <div style="margin-top:6px;font-size:11px;color:var(--tx2)">Pump commands from tank are ACKed automatically</div>
-    </div>
+    <div class="section-label" style="margin-top:14px">Pond Node Simulation <span style="font-weight:400;text-transform:none;letter-spacing:0">(pond 0x03)</span></div>
+    <div class="pond-state">Pond pump: <span id="pondPumpState">OFF</span></div>
+    <button class="btn act" onclick="sendCmd('telemetry','')" style="width:100%">Send Telemetry Now</button>
+    <div style="margin-top:6px;font-size:11px;color:var(--tx2)">Auto-ACKs pump cmds from tank &bull; keepalive every 30s &bull; telemetry every 25s</div>
   </div>
 
   <!-- ── Config ── -->
   <div class="card">
-    <h2>Config <span class="chip" id="cfgChip">waiting...</span></h2>
-    <div id="cfgBody"><div class="empty-note">Send "Get Config" to populate</div></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <h2 style="margin:0">Config</h2>
+      <span class="chip" id="cfgChip">waiting...</span>
+    </div>
+    <div id="cfgBody"></div>
+    <div class="cfg-bar" id="cfgBar">
+      <button class="btn" id="cfgResetBtn" onclick="resetCfgDefaults()">Defaults</button>
+      <button class="btn act" id="cfgSetBtn" onclick="sendCfgSet()" disabled>Set Config</button>
+      <span class="cfg-status" id="cfgStatus"></span>
+    </div>
   </div>
 
   <!-- ── Stats ── -->
@@ -280,7 +287,6 @@ let ws = null;
 let reconnectTimer = null;
 let lastSeenTimer  = null;
 let lastSeenMs     = 0;
-let currentRole    = 'gateway';
 const MAX_LOG = 120;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -290,11 +296,13 @@ function connect() {
   ws.onopen = () => {
     setDot(true);
     addLog('inf', 'WebSocket connected');
+    document.getElementById('cfgSetBtn').disabled = false;
     clearTimeout(reconnectTimer);
   };
   ws.onclose = () => {
     setDot(false);
     addLog('err', 'WebSocket disconnected — reconnecting in 2 s...');
+    document.getElementById('cfgSetBtn').disabled = true;
     reconnectTimer = setTimeout(connect, 2000);
   };
   ws.onerror = () => {
@@ -342,24 +350,12 @@ function handleMsg(d) {
     }
 
     case 'cfg': {
-      const rows = [
-        ['pump_min_runtime',   d.pmr + ' ms'],
-        ['pump_min_cooldown',  d.pmc + ' ms'],
-        ['replenish_runon',    d.pro + ' ms'],
-        ['telemetry_interval', d.ti  + ' ms'],
-        ['network_timeout',    d.nt  + ' ms'],
-        ['ack_timeout',        d.at  + ' ms'],
-        ['overcurrent_thresh', d.oct],
-        ['dryrun_thresh',      d.drt],
-        ['ack_max_retries',    d.amr],
-        ['boot_auto_mode',     d.bam ? 'YES' : 'NO'],
-        ['oc_grace_ticks',     d.ocg + ' × 50ms'],
-        ['fault_lockout',      d.fle ? 'ENABLED' : 'warn-only'],
-      ];
-      document.getElementById('cfgBody').innerHTML = buildTable(rows);
-      document.getElementById('cfgChip').textContent  = 'rssi=' + d.rssi + ' snr=' + d.snr;
-      document.getElementById('cfgChip').className    = 'chip ok';
-      addLog('rx', `CONFIG_RESP  rssi=${d.rssi}  snr=${d.snr}`);
+      buildCfgForm(d);
+      document.getElementById('cfgChip').textContent   = 'live · rssi=' + d.rssi + ' snr=' + d.snr;
+      document.getElementById('cfgChip').className     = 'chip ok';
+      document.getElementById('cfgSetBtn').disabled    = false;
+      document.getElementById('cfgStatus').textContent = '';
+      addLog('rx', `CONFIG_RESP  pmr=${d.pmr/1000}s pmc=${d.pmc/1000}s pro=${d.pro/1000}s ti=${d.ti/1000}s nt=${d.nt/1000}s at=${d.at/1000}s amr=${d.amr} bam=${d.bam}  rssi=${d.rssi}`);
       break;
     }
 
@@ -401,23 +397,11 @@ function handleMsg(d) {
       break;
 
     case 'role':
-      currentRole = d.role;
-      document.getElementById('roleBadge').textContent = d.role.toUpperCase();
-      document.getElementById('tabGw').classList.toggle('active',   d.role === 'gateway');
-      document.getElementById('tabPond').classList.toggle('active',  d.role === 'pond');
-      document.getElementById('gwSection').style.display   = d.role === 'gateway' ? '' : 'none';
-      document.getElementById('pondSection').style.display = d.role === 'pond'    ? '' : 'none';
-      addLog('inf', 'Role changed → ' + d.role.toUpperCase());
+      addLog('inf', 'Mode: ' + (d.role || 'dual').toUpperCase());
       break;
 
     case 'status':
-      currentRole = d.role;
-      document.getElementById('roleBadge').textContent = d.role.toUpperCase();
-      document.getElementById('hdrHeap').textContent   = Math.round(d.heap / 1024) + 'k';
-      document.getElementById('tabGw').classList.toggle('active',   d.role === 'gateway');
-      document.getElementById('tabPond').classList.toggle('active',  d.role === 'pond');
-      document.getElementById('gwSection').style.display   = d.role === 'gateway' ? '' : 'none';
-      document.getElementById('pondSection').style.display = d.role === 'pond'    ? '' : 'none';
+      document.getElementById('hdrHeap').textContent = Math.round(d.heap / 1024) + 'k';
       break;
   }
 }
@@ -478,14 +462,98 @@ function sendCmd(cmd, params) {
   addLog('cmd', '→ ' + msg);
 }
 
-function setRole(role) {
+// ── Config editor ─────────────────────────────────────────────────────────
+
+// Raw ms/unit values — mirrors DEF_* in config.hpp
+const CFG_DEFAULTS = { pmr:30000, pmc:60000, pro:300000, ti:30000, nt:60000, at:10000, amr:5, bam:1 };
+
+const CFG_FIELDS = [
+  { key:'pmr', label:'Pump min runtime',   ms:true,  min:5,   max:3600,  def:30  },
+  { key:'pmc', label:'Pump min cooldown',  ms:true,  min:5,   max:3600,  def:60  },
+  { key:'pro', label:'Replenish run-on',   ms:true,  min:30,  max:86400, def:300 },
+  { key:'ti',  label:'Telemetry interval', ms:true,  min:5,   max:3600,  def:30  },
+  { key:'nt',  label:'Network timeout',    ms:true,  min:10,  max:3600,  def:60  },
+  { key:'at',  label:'ACK timeout',        ms:true,  min:1,   max:60,    def:10  },
+  { key:'amr', label:'ACK max retries',    ms:false, min:1,   max:10,    def:5   },
+  { key:'bam', label:'Boot auto mode',     bool:true,                    def:1   },
+];
+
+function buildCfgForm(d) {
+  let h = '';
+  for (const f of CFG_FIELDS) {
+    const raw = d[f.key];
+    if (f.bool) {
+      h += `<div class="cfg-row">
+        <span class="cfg-name">${f.label}</span>
+        <select class="cfg-inp" id="cfg_${f.key}" onchange="this.classList.add('dirty')">
+          <option value="1"${raw ? ' selected' : ''}>YES</option>
+          <option value="0"${!raw ? ' selected' : ''}>NO</option>
+        </select>
+        <span class="cfg-unit"></span>
+        <span class="cfg-hint">YES / NO</span>
+      </div>`;
+    } else {
+      const disp = f.ms ? raw / 1000 : raw;
+      h += `<div class="cfg-row">
+        <span class="cfg-name">${f.label}</span>
+        <input class="cfg-inp" type="number" id="cfg_${f.key}"
+               value="${disp}" min="${f.min}" max="${f.max}" step="1"
+               onchange="this.classList.add('dirty')">
+        <span class="cfg-unit">${f.ms ? 's' : ''}</span>
+        <span class="cfg-hint">${f.min}–${f.max}</span>
+      </div>`;
+    }
+  }
+  document.getElementById('cfgBody').innerHTML = h;
+}
+
+function sendCfgSet() {
   if (!ws || ws.readyState !== WebSocket.OPEN) { addLog('err', 'Not connected'); return; }
-  const msg = JSON.stringify({ cmd: 'role', v: role });
-  ws.send(msg);
-  addLog('cmd', '→ ' + msg);
+  if (!document.getElementById('cfg_pmr')) { addLog('err', 'Load config first (Get Config)'); return; }
+
+  const msg = { cmd: 'cfg_set' };
+  for (const f of CFG_FIELDS) {
+    const el = document.getElementById('cfg_' + f.key);
+    if (!el) { addLog('err', 'Missing field: ' + f.key); return; }
+    if (f.bool) {
+      msg[f.key] = parseInt(el.value);
+    } else {
+      msg[f.key] = f.ms ? Math.round(parseFloat(el.value) * 1000) : Math.round(parseFloat(el.value));
+    }
+  }
+
+  // Client-side validation mirrors tank's validateConfig() in nvs_manager.hpp
+  const checks = [
+    [msg.pmr, 5000,   3600000,   'pump_min_runtime (5–3600 s)'],
+    [msg.pmc, 5000,   3600000,   'pump_min_cooldown (5–3600 s)'],
+    [msg.pro, 30000,  86400000,  'replenish_runon (30–86400 s)'],
+    [msg.ti,  5000,   3600000,   'telemetry_interval (5–3600 s)'],
+    [msg.nt,  10000,  3600000,   'network_timeout (10–3600 s)'],
+    [msg.at,  1000,   60000,     'ack_timeout (1–60 s)'],
+    [msg.amr, 1,      10,        'ack_max_retries (1–10)'],
+  ];
+  for (const [v, lo, hi, name] of checks) {
+    if (!Number.isFinite(v) || v < lo || v > hi) { addLog('err', name + ' out of range'); return; }
+  }
+
+  const json = JSON.stringify(msg);
+  ws.send(json);
+  addLog('cmd', '→ ' + json);
+  document.getElementById('cfgSetBtn').disabled = true;
+  document.getElementById('cfgStatus').textContent = 'Sent — waiting for CONFIG_RESP...';
+}
+
+function resetCfgDefaults() {
+  buildCfgForm(CFG_DEFAULTS);
+  document.getElementById('cfgChip').textContent  = 'defaults';
+  document.getElementById('cfgChip').className    = 'chip unk';
+  document.getElementById('cfgStatus').textContent = '';
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
+buildCfgForm(CFG_DEFAULTS);
+document.getElementById('cfgChip').textContent = 'defaults';
+document.getElementById('cfgChip').className   = 'chip unk';
 connect();
 </script>
 </body>

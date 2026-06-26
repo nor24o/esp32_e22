@@ -53,6 +53,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include "web_page.h"
+#include "protocol.hpp"   // shared: structs, node IDs, RF settings (freq/BW/SF/CR/sync/preamble)
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -70,105 +71,23 @@
 #define LORA_MOSI  27
 
 // =============================================================================
-// RF SETTINGS
+// TTGO-SPECIFIC RF SETTINGS
 // =============================================================================
 
-#define LORA_FREQUENCY   868.0f
-#define LORA_BANDWIDTH   125.0f
-#define LORA_SF          9
-#define LORA_CR          5
-#define LORA_SYNC_WORD   0x12
-#define LORA_TX_POWER    17
-#define LORA_PREAMBLE    8
+// LORA_TX_POWER is node-specific: TTGO SX1276 max 14 dBm; tank SX1262 uses 22 dBm
+#define LORA_TX_POWER    14
+// All other RF parameters (frequency, BW, SF, CR, sync word, preamble)
+// are inherited from protocol.hpp so they always match the tank.
 
 // Keepalive / telemetry intervals
 #define GATEWAY_KEEPALIVE_MS   30000UL  // send CONFIG_GET to tank every 30 s
 #define POND_TELEMETRY_MS      25000UL  // send telemetry to tank every 25 s
 #define STATUS_BCAST_MS         5000UL  // push status JSON every 5 s
 
-// =============================================================================
-// PROTOCOL (keep in sync with include/protocol.hpp on the tank)
-// =============================================================================
-
-#define MY_NETWORK_MAGIC  0x5A6B
-#define NODE_GATEWAY      0x01
-#define NODE_TANK_LOCAL   0x02
-#define NODE_POND_REMOTE  0x03
-#define NODE_BROADCAST    0xFF
-
-enum MessageType : uint8_t {
-    MSG_TELEMETRY   = 1,
-    MSG_COMMAND     = 2,
-    MSG_ACK         = 3,
-    MSG_CONFIG_GET  = 4,
-    MSG_CONFIG_SET  = 5,
-    MSG_CONFIG_RESP = 6,
-    MSG_STATS_GET   = 7,
-    MSG_STATS_RESP  = 8,
-};
-
-struct __attribute__((packed)) LoRaHeader {
-    uint16_t magic_word;
-    uint8_t  target_id;
-    uint8_t  sender_id;
-    uint8_t  msg_id;
-    uint8_t  msg_type;
-};
-
-struct __attribute__((packed)) TelemetryData {
-    uint8_t  water_level;
-    uint8_t  system_flags;  // bit0=Auto bit1=P1 bit2=P2 bit3=P3 bit4=PondP
-    int16_t  temperature;   // °C × 10
-    uint8_t  humidity;
-    uint8_t  error_code;    // 0=OK 1=OC 2=DryRun 3=Comms
-    int8_t   last_rssi;
-    int8_t   last_snr;
-};
-
-struct __attribute__((packed)) CommandData {
-    uint8_t target_pump;    // 1-4; also acked-msg-id in ACK frames
-    uint8_t action;         // 0=Off 1=On
-    uint8_t flags;          // bit0=Force Override
-};
-
-struct __attribute__((packed)) NodeConfig {
-    uint32_t pump_min_runtime_ms;
-    uint32_t pump_min_cooldown_ms;
-    uint32_t replenish_runon_ms;
-    uint32_t telemetry_interval_ms;
-    uint32_t network_timeout_ms;
-    uint32_t ack_timeout_ms;
-    uint16_t overcurrent_thresh;
-    uint16_t dryrun_thresh;
-    uint8_t  ack_max_retries;
-    uint8_t  boot_auto_mode;
-    uint8_t  overcurrent_grace_ticks;
-    uint8_t  fault_lockout_enabled;
-};
-
-struct __attribute__((packed)) StatsPayload {
-    uint32_t uptime_s;
-    uint32_t runtime_p1_s;
-    uint32_t runtime_p2_s;
-    uint32_t runtime_p3_s;
-    uint32_t runtime_pond_s;
-    uint16_t fill_cycles;
-    uint16_t boot_count;
-    uint8_t  last_fault;
-    uint8_t  reserved[7];
-};
-
-struct __attribute__((packed)) LoRaPacket {
-    LoRaHeader header;
-    union {
-        TelemetryData telemetry;
-        CommandData   command;
-        NodeConfig    config;
-        StatsPayload  stats;
-    } payload;
-};
-
-static_assert(sizeof(LoRaPacket) <= 255, "LoRaPacket too large");
+// After any TX the channel is busy: tank ACKs (~330 ms), then relays to pond (~330 ms),
+// then TTGO auto-ACKs (~330 ms) = ~1 s total.  Hold off periodic TX for 2.5 s so we
+// stay in RX and catch the relay command.
+#define RADIO_QUIET_MS         2500UL
 
 // =============================================================================
 // RADIO
@@ -200,21 +119,23 @@ static void broadcastJson(const char *json) {
 
 // =============================================================================
 // RUNTIME STATE
+// Dual-mode: acts as NODE_GATEWAY (0x01) AND NODE_POND_REMOTE (0x03) simultaneously.
+// Gateway commands use sender 0x01; pond commands use sender 0x03.
+// Receives packets addressed to either ID.
 // =============================================================================
 
-enum NodeRole : uint8_t { ROLE_GATEWAY = 0, ROLE_POND = 1 };
-static NodeRole  gRole      = ROLE_GATEWAY;
 static uint8_t   gMsgId     = 0;
 static int8_t    gLastRssi  = 0;
 static int8_t    gLastSnr   = 0;
 
-// Pond-node state (used in ROLE_POND only)
+// Pond simulation state
 static bool      gPondPumpOn = false;  // commanded state from tank
 
 // Timers
 static uint32_t  gLastKeepalive_ms  = 0;
 static uint32_t  gLastTelemetry_ms  = 0;
 static uint32_t  gLastStatusBcast   = 0;
+static uint32_t  gQuietUntil_ms     = 0;  // periodic TX suppressed until this timestamp
 
 // =============================================================================
 // JSON BROADCAST HELPERS
@@ -227,17 +148,10 @@ static void bcastLog(const char *lvl, const char *msg) {
     broadcastJson(gJsonBuf);
 }
 
-static void bcastRole() {
-    const char *r = (gRole == ROLE_GATEWAY) ? "gateway" : "pond";
-    snprintf(gJsonBuf, sizeof(gJsonBuf), "{\"t\":\"role\",\"role\":\"%s\"}", r);
-    broadcastJson(gJsonBuf);
-}
-
 static void bcastStatus() {
-    const char *r = (gRole == ROLE_GATEWAY) ? "gateway" : "pond";
     snprintf(gJsonBuf, sizeof(gJsonBuf),
-             "{\"t\":\"status\",\"role\":\"%s\",\"heap\":%lu,\"uptime\":%lu,\"clients\":%u}",
-             r, (unsigned long)ESP.getFreeHeap(),
+             "{\"t\":\"status\",\"heap\":%lu,\"uptime\":%lu,\"clients\":%u}",
+             (unsigned long)ESP.getFreeHeap(),
              (unsigned long)(millis() / 1000),
              (unsigned)ws.count());
     broadcastJson(gJsonBuf);
@@ -272,7 +186,7 @@ static void bcastCfg(const NodeConfig &c, int8_t rssi, int8_t snr) {
     snprintf(gJsonBuf, sizeof(gJsonBuf),
              "{\"t\":\"cfg\","
              "\"pmr\":%lu,\"pmc\":%lu,\"pro\":%lu,\"ti\":%lu,\"nt\":%lu,\"at\":%lu,"
-             "\"oct\":%u,\"drt\":%u,\"amr\":%u,\"bam\":%u,\"ocg\":%u,\"fle\":%u,"
+             "\"amr\":%u,\"bam\":%u,"
              "\"rssi\":%d,\"snr\":%d}",
              (unsigned long)c.pump_min_runtime_ms,
              (unsigned long)c.pump_min_cooldown_ms,
@@ -280,12 +194,8 @@ static void bcastCfg(const NodeConfig &c, int8_t rssi, int8_t snr) {
              (unsigned long)c.telemetry_interval_ms,
              (unsigned long)c.network_timeout_ms,
              (unsigned long)c.ack_timeout_ms,
-             (unsigned)c.overcurrent_thresh,
-             (unsigned)c.dryrun_thresh,
              (unsigned)c.ack_max_retries,
              (unsigned)c.boot_auto_mode,
-             (unsigned)c.overcurrent_grace_ticks,
-             (unsigned)c.fault_lockout_enabled,
              (int)rssi, (int)snr);
     broadcastJson(gJsonBuf);
 }
@@ -332,8 +242,6 @@ static void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     if (type == WS_EVT_CONNECT) {
         Serial.printf("[WS] Client #%u connected  IP=%s\n",
                       client->id(), client->remoteIP().toString().c_str());
-        // Send current role and status immediately
-        bcastRole();
         bcastStatus();
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
@@ -354,8 +262,7 @@ static void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 // TRANSMIT HELPER
 // =============================================================================
 
-static void sendPacket(LoRaPacket &pkt, uint8_t target, uint8_t msgType) {
-    uint8_t senderId = (gRole == ROLE_GATEWAY) ? NODE_GATEWAY : NODE_POND_REMOTE;
+static void sendPacket(LoRaPacket &pkt, uint8_t target, uint8_t msgType, uint8_t senderId) {
     pkt.header.magic_word = MY_NETWORK_MAGIC;
     pkt.header.target_id  = target;
     pkt.header.sender_id  = senderId;
@@ -374,6 +281,8 @@ static void sendPacket(LoRaPacket &pkt, uint8_t target, uint8_t msgType) {
         bcastLog("err", tmp);
     }
     radio.startReceive();
+    // Hold off periodic TX so we stay in RX for the tank's ACK + relay to pond.
+    gQuietUntil_ms = millis() + RADIO_QUIET_MS;
 }
 
 // =============================================================================
@@ -382,12 +291,18 @@ static void sendPacket(LoRaPacket &pkt, uint8_t target, uint8_t msgType) {
 
 static void gw_sendConfigGet() {
     LoRaPacket pkt; memset(&pkt, 0, sizeof(pkt));
-    sendPacket(pkt, NODE_TANK_LOCAL, MSG_CONFIG_GET);
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_CONFIG_GET, NODE_GATEWAY);
 }
 
 static void gw_sendStatsGet() {
     LoRaPacket pkt; memset(&pkt, 0, sizeof(pkt));
-    sendPacket(pkt, NODE_TANK_LOCAL, MSG_STATS_GET);
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_STATS_GET, NODE_GATEWAY);
+}
+
+static void gw_sendConfigSet(const NodeConfig &cfg) {
+    LoRaPacket pkt; memset(&pkt, 0, sizeof(pkt));
+    pkt.payload.config = cfg;
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_CONFIG_SET, NODE_GATEWAY);
 }
 
 static void gw_sendPumpCommand(uint8_t pump, uint8_t action) {
@@ -395,7 +310,7 @@ static void gw_sendPumpCommand(uint8_t pump, uint8_t action) {
     pkt.payload.command.target_pump = pump;
     pkt.payload.command.action      = action;
     pkt.payload.command.flags       = 0x01;  // force-override auto mode
-    sendPacket(pkt, NODE_TANK_LOCAL, MSG_COMMAND);
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_COMMAND, NODE_GATEWAY);
 }
 
 // =============================================================================
@@ -407,12 +322,11 @@ static void pond_sendAck(uint8_t ackedMsgId) {
     pkt.payload.command.target_pump = ackedMsgId;  // convention: acked id goes here
     pkt.payload.command.action      = 0;
     pkt.payload.command.flags       = 0;
-    sendPacket(pkt, NODE_TANK_LOCAL, MSG_ACK);
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_ACK, NODE_POND_REMOTE);
 }
 
 static void pond_sendTelemetry() {
     LoRaPacket pkt; memset(&pkt, 0, sizeof(pkt));
-    // Simulated pond telemetry — system_flags bit4 reflects commanded pump state
     pkt.payload.telemetry.water_level  = 2;    // pond always has water
     pkt.payload.telemetry.system_flags = gPondPumpOn ? (1 << 4) : 0;
     pkt.payload.telemetry.temperature  = 210;  // 21.0 °C placeholder
@@ -420,7 +334,7 @@ static void pond_sendTelemetry() {
     pkt.payload.telemetry.error_code   = 0;
     pkt.payload.telemetry.last_rssi    = gLastRssi;
     pkt.payload.telemetry.last_snr     = gLastSnr;
-    sendPacket(pkt, NODE_TANK_LOCAL, MSG_TELEMETRY);
+    sendPacket(pkt, NODE_TANK_LOCAL, MSG_TELEMETRY, NODE_POND_REMOTE);
     gLastTelemetry_ms = millis();
     Serial.printf("[POND] Telemetry sent  pumpOn=%s\n", gPondPumpOn ? "YES" : "no");
 }
@@ -471,8 +385,8 @@ static void decodeAndPrint(const LoRaPacket *pkt, int8_t rssi, int8_t snr) {
             Serial.printf( "│   Force-ovr   : %s\n",  (cmd.flags & 0x01) ? "yes" : "no");
             bcastCmd(cmd.target_pump, cmd.action, pkt->header.msg_id, rssi, snr);
 
-            // In pond role: apply command and ACK immediately
-            if (gRole == ROLE_POND && cmd.target_pump == 1) {
+            // Auto-ACK when the packet was sent to us as pond node (0x03)
+            if (pkt->header.target_id == NODE_POND_REMOTE && cmd.target_pump == 1) {
                 gPondPumpOn = (cmd.action == 1);
                 Serial.printf("│   → Pond pump commanded %s — sending ACK\n",
                               gPondPumpOn ? "ON" : "OFF");
@@ -498,13 +412,8 @@ static void decodeAndPrint(const LoRaPacket *pkt, int8_t rssi, int8_t snr) {
             Serial.printf( "│   telemetry_interval  : %lu ms\n",  c.telemetry_interval_ms);
             Serial.printf( "│   network_timeout     : %lu ms\n",  c.network_timeout_ms);
             Serial.printf( "│   ack_timeout         : %lu ms\n",  c.ack_timeout_ms);
-            Serial.printf( "│   overcurrent_thresh  : %u  dryrun_thresh: %u\n",
-                           c.overcurrent_thresh, c.dryrun_thresh);
             Serial.printf( "│   ack_max_retries     : %u\n",      c.ack_max_retries);
             Serial.printf( "│   boot_auto_mode      : %u\n",      c.boot_auto_mode);
-            Serial.printf( "│   oc_grace_ticks      : %u (x50ms)\n", c.overcurrent_grace_ticks);
-            Serial.printf( "│   fault_lockout       : %s\n",
-                           c.fault_lockout_enabled ? "ENABLED" : "warn-only");
             bcastCfg(c, rssi, snr);
             break;
         }
@@ -536,89 +445,84 @@ static void decodeAndPrint(const LoRaPacket *pkt, int8_t rssi, int8_t snr) {
 // =============================================================================
 
 static void processWsCommand(const char *json) {
-    // Minimal key extraction with strstr — no JSON lib dependency
-    if (strstr(json, "\"cmd\":\"role\"")) {
-        if (strstr(json, "\"pond\"")) {
-            Serial.println("[WS] Role → POND");
-            gRole             = ROLE_POND;
-            gLastTelemetry_ms = millis();
-            gPondPumpOn       = false;
-            bcastRole();
-            bcastLog("inf", "Role switched to POND");
-        } else if (strstr(json, "\"gateway\"")) {
-            Serial.println("[WS] Role → GATEWAY");
-            gRole               = ROLE_GATEWAY;
-            gLastKeepalive_ms   = millis();
-            bcastRole();
-            bcastLog("inf", "Role switched to GATEWAY");
-        }
-    } else if (strstr(json, "\"cmd\":\"pump\"")) {
-        if (gRole != ROLE_GATEWAY) { bcastLog("err", "Must be GATEWAY to send pump commands"); return; }
-        // Parse "p" and "a" fields: {"cmd":"pump","p":1,"a":1}
+    if (strstr(json, "\"cmd\":\"pump\"")) {
         const char *pp = strstr(json, "\"p\":");
         const char *ap = strstr(json, "\"a\":");
         if (pp && ap) {
             uint8_t pump   = (uint8_t)atoi(pp + 4);
             uint8_t action = (uint8_t)atoi(ap + 4);
-            if (pump >= 1 && pump <= 3) {
+            if (pump >= 1 && pump <= 4) {
                 gw_sendPumpCommand(pump, action);
             }
         }
     } else if (strstr(json, "\"cmd\":\"cfg_get\"")) {
-        if (gRole != ROLE_GATEWAY) { bcastLog("err", "Must be GATEWAY for cfg_get"); return; }
         gw_sendConfigGet();
     } else if (strstr(json, "\"cmd\":\"stats_get\"")) {
-        if (gRole != ROLE_GATEWAY) { bcastLog("err", "Must be GATEWAY for stats_get"); return; }
         gw_sendStatsGet();
     } else if (strstr(json, "\"cmd\":\"keepalive\"")) {
-        if (gRole != ROLE_GATEWAY) { bcastLog("err", "Must be GATEWAY for keepalive"); return; }
         gw_sendConfigGet();
         gLastKeepalive_ms = millis();
     } else if (strstr(json, "\"cmd\":\"telemetry\"")) {
-        if (gRole != ROLE_POND) { bcastLog("err", "Must be POND for telemetry"); return; }
         pond_sendTelemetry();
+    } else if (strstr(json, "\"cmd\":\"cfg_set\"")) {
+        auto getU32 = [](const char *j, const char *key) -> uint32_t {
+            const char *p = strstr(j, key);
+            if (!p) return 0;
+            p += strlen(key);
+            while (*p == ':' || *p == ' ') ++p;
+            return (uint32_t)atol(p);
+        };
+        auto getU8 = [](const char *j, const char *key) -> uint8_t {
+            const char *p = strstr(j, key);
+            if (!p) return 0;
+            p += strlen(key);
+            while (*p == ':' || *p == ' ') ++p;
+            return (uint8_t)atoi(p);
+        };
+
+        NodeConfig c;
+        memset(&c, 0, sizeof(c));
+        c.pump_min_runtime_ms   = getU32(json, "\"pmr\"");
+        c.pump_min_cooldown_ms  = getU32(json, "\"pmc\"");
+        c.replenish_runon_ms    = getU32(json, "\"pro\"");
+        c.telemetry_interval_ms = getU32(json, "\"ti\"");
+        c.network_timeout_ms    = getU32(json, "\"nt\"");
+        c.ack_timeout_ms        = getU32(json, "\"at\"");
+        c.ack_max_retries       = getU8(json,  "\"amr\"");
+        c.boot_auto_mode        = getU8(json,  "\"bam\"");
+
+        Serial.printf("[WS] cfg_set  pmr=%lu pmc=%lu pro=%lu ti=%lu nt=%lu at=%lu amr=%u bam=%u\n",
+                      (unsigned long)c.pump_min_runtime_ms, (unsigned long)c.pump_min_cooldown_ms,
+                      (unsigned long)c.replenish_runon_ms,  (unsigned long)c.telemetry_interval_ms,
+                      (unsigned long)c.network_timeout_ms,  (unsigned long)c.ack_timeout_ms,
+                      (unsigned)c.ack_max_retries, (unsigned)c.boot_auto_mode);
+        gw_sendConfigSet(c);
+        bcastLog("inf", "CONFIG_SET sent — waiting for CONFIG_RESP to confirm...");
     }
 }
 
 // =============================================================================
-// HELP / ROLE PRINT
+// HELP PRINT
 // =============================================================================
 
 static void printHelp() {
     Serial.println();
-    const char *roleName = (gRole == ROLE_GATEWAY) ? "GATEWAY (0x01)" : "POND NODE (0x03)";
-    Serial.printf("=== LoRa Dual-Role Test | Current role: %s ===\n", roleName);
-    Serial.printf("=== Web UI: http://192.168.4.1  (SSID: LoRaTest-TTGO) ===\n");
-    Serial.println("  g   — switch to GATEWAY role  (NODE_GATEWAY  0x01)");
-    Serial.println("  p   — switch to POND NODE role (NODE_POND_REMOTE 0x03)");
-    Serial.println("  h   — this help");
-    if (gRole == ROLE_GATEWAY) {
-        Serial.println("  --- Gateway commands ---");
-        Serial.println("  c   — MSG_CONFIG_GET");
-        Serial.println("  s   — MSG_STATS_GET");
-        Serial.println("  1/! — Pump 1 ON/OFF (force-override)");
-        Serial.println("  2/@ — Pump 2 ON/OFF");
-        Serial.println("  3/# — Pump 3 ON/OFF");
-        Serial.println("  k   — send keepalive ping now");
-    } else {
-        Serial.println("  --- Pond node commands ---");
-        Serial.println("  t   — send telemetry to tank now");
-        Serial.println("  (pump commands from tank are ACKed automatically)");
-    }
+    Serial.println("=== LoRa Test | DUAL MODE: Gateway 0x01 + Pond 0x03 simultaneous ===");
+    Serial.printf( "=== Web UI: http://192.168.4.1  (SSID: LoRaTest-TTGO) ===\n");
+    Serial.println("  h/?  — this help");
+    Serial.println("  --- Gateway commands (sender=0x01) ---");
+    Serial.println("  c    — MSG_CONFIG_GET");
+    Serial.println("  s    — MSG_STATS_GET");
+    Serial.println("  k    — keepalive ping");
+    Serial.println("  1/!  — Pump 1 ON/OFF  (force-override)");
+    Serial.println("  2/@  — Pump 2 ON/OFF");
+    Serial.println("  3/#  — Pump 3 ON/OFF");
+    Serial.println("  4/$  — Pond Pump ON/OFF");
+    Serial.println("  --- Pond commands (sender=0x03) ---");
+    Serial.println("  t    — send telemetry to tank");
+    Serial.println("  (pond pump commands auto-ACKed when received as 0x03)");
     Serial.println("=================================================");
     Serial.println();
-}
-
-static void switchRole(NodeRole newRole) {
-    gRole               = newRole;
-    gLastKeepalive_ms   = millis();
-    gLastTelemetry_ms   = millis();
-    gPondPumpOn         = false;
-    const char *name    = (newRole == ROLE_GATEWAY) ? "GATEWAY (0x01)" : "POND NODE (0x03)";
-    Serial.printf("\n[ROLE] Switched to %s\n", name);
-    bcastRole();
-    bcastLog("inf", newRole == ROLE_GATEWAY ? "Role switched to GATEWAY" : "Role switched to POND");
-    printHelp();
 }
 
 // =============================================================================
@@ -626,7 +530,9 @@ static void switchRole(NodeRole newRole) {
 // =============================================================================
 
 static void setupWiFi() {
+    WiFi.mode(WIFI_AP);
     WiFi.softAP("LoRaTest-TTGO", "loratest1");
+    delay(200);
     IPAddress ip = WiFi.softAPIP();
     Serial.printf("[WIFI] AP started  SSID=LoRaTest-TTGO  IP=%s\n", ip.toString().c_str());
 }
@@ -636,7 +542,7 @@ static void setupWebServer() {
     server.addHandler(&ws);
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
-        req->send_P(200, "text/html", INDEX_HTML);
+        req->send(200, "text/html", INDEX_HTML);
     });
 
     server.begin();
@@ -730,15 +636,15 @@ void loop() {
                 int8_t snr  = (int8_t)radio.getSNR();
                 LoRaPacket *pkt = reinterpret_cast<LoRaPacket *>(buf);
 
-                uint8_t myId = (gRole == ROLE_GATEWAY) ? NODE_GATEWAY : NODE_POND_REMOTE;
                 bool forMe = (pkt->header.magic_word == MY_NETWORK_MAGIC) &&
-                             (pkt->header.target_id  == myId ||
-                              pkt->header.target_id  == NODE_BROADCAST);
+                             (pkt->header.target_id == NODE_GATEWAY     ||
+                              pkt->header.target_id == NODE_POND_REMOTE ||
+                              pkt->header.target_id == NODE_BROADCAST);
                 if (forMe) {
                     decodeAndPrint(pkt, rssi, snr);
                 } else {
-                    Serial.printf("[RX] Ignored — magic=0x%04X target=0x%02X (my id=0x%02X)\n",
-                                  pkt->header.magic_word, pkt->header.target_id, myId);
+                    Serial.printf("[RX] Ignored — magic=0x%04X target=0x%02X\n",
+                                  pkt->header.magic_word, pkt->header.target_id);
                 }
             } else {
                 Serial.printf("[RX] readData error: %d\n", state);
@@ -753,17 +659,16 @@ void loop() {
         radio.startReceive();
     }
 
-    // ── Periodic LoRa actions ─────────────────────────────────────────────────
-    if (gRole == ROLE_GATEWAY) {
-        // Send a CONFIG_GET every 30 s so the tank's lastGatewayContact_ms stays fresh
+    // ── Periodic LoRa actions (suppressed during quiet window after any TX) ──────
+    // The quiet window ensures we stay in RX long enough to receive the tank's ACK
+    // and the tank's relay command to the pond node (and then ACK that too).
+    if (now >= gQuietUntil_ms) {
         if ((now - gLastKeepalive_ms) >= GATEWAY_KEEPALIVE_MS) {
             gLastKeepalive_ms = now;
-            Serial.println("[GW] Sending keepalive CONFIG_GET...");
-            bcastLog("inf", "Sending keepalive CONFIG_GET...");
+            Serial.println("[GW] Keepalive CONFIG_GET...");
+            bcastLog("inf", "Keepalive CONFIG_GET...");
             gw_sendConfigGet();
         }
-    } else {
-        // Send telemetry to tank every 25 s so lastPondContact_ms stays fresh
         if ((now - gLastTelemetry_ms) >= POND_TELEMETRY_MS) {
             pond_sendTelemetry();
         }
@@ -773,55 +678,19 @@ void loop() {
     if (Serial.available()) {
         char cmd = (char)Serial.read();
         switch (cmd) {
-            // Role switching — always available
-            case 'g': switchRole(ROLE_GATEWAY);  break;
-            case 'p': switchRole(ROLE_POND);     break;
-            case 'h': case '?': printHelp();     break;
-
-            // Gateway commands
-            case 'c':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] CONFIG_GET");   gw_sendConfigGet();     }
-                else Serial.println("[!] Switch to gateway mode first (press 'g')");
-                break;
-            case 's':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] STATS_GET");    gw_sendStatsGet();      }
-                else Serial.println("[!] Switch to gateway mode first (press 'g')");
-                break;
-            case 'k':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Keepalive");    gw_sendConfigGet(); gLastKeepalive_ms = now; }
-                else Serial.println("[!] Switch to gateway mode first (press 'g')");
-                break;
-            case '1':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 1 ON");    gw_sendPumpCommand(1,1); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-            case '!':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 1 OFF");   gw_sendPumpCommand(1,0); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-            case '2':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 2 ON");    gw_sendPumpCommand(2,1); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-            case '@':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 2 OFF");   gw_sendPumpCommand(2,0); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-            case '3':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 3 ON");    gw_sendPumpCommand(3,1); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-            case '#':
-                if (gRole == ROLE_GATEWAY) { Serial.println("[GW] Pump 3 OFF");   gw_sendPumpCommand(3,0); }
-                else Serial.println("[!] Gateway mode only");
-                break;
-
-            // Pond commands
-            case 't':
-                if (gRole == ROLE_POND) { pond_sendTelemetry(); }
-                else Serial.println("[!] Switch to pond mode first (press 'p')");
-                break;
-
+            case 'h': case '?': printHelp();                                        break;
+            case 'c': Serial.println("[GW] CONFIG_GET");   gw_sendConfigGet();      break;
+            case 's': Serial.println("[GW] STATS_GET");    gw_sendStatsGet();       break;
+            case 'k': Serial.println("[GW] Keepalive");    gw_sendConfigGet(); gLastKeepalive_ms = now; break;
+            case '1': Serial.println("[GW] Pump 1 ON");    gw_sendPumpCommand(1,1); break;
+            case '!': Serial.println("[GW] Pump 1 OFF");   gw_sendPumpCommand(1,0); break;
+            case '2': Serial.println("[GW] Pump 2 ON");    gw_sendPumpCommand(2,1); break;
+            case '@': Serial.println("[GW] Pump 2 OFF");   gw_sendPumpCommand(2,0); break;
+            case '3': Serial.println("[GW] Pump 3 ON");    gw_sendPumpCommand(3,1); break;
+            case '#': Serial.println("[GW] Pump 3 OFF");   gw_sendPumpCommand(3,0); break;
+            case '4': Serial.println("[GW] Pond Pump ON"); gw_sendPumpCommand(4,1); break;
+            case '$': Serial.println("[GW] Pond Pump OFF");gw_sendPumpCommand(4,0); break;
+            case 't': Serial.println("[POND] Telemetry");  pond_sendTelemetry();    break;
             case '\r': case '\n': break;
             default:
                 Serial.printf("[?] Unknown command '%c' — press 'h' for help\n", cmd);
