@@ -76,6 +76,8 @@ body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-s
     <button class="btn act" id="spd10" onclick="setSpeed(10)">10×</button>
     <button class="btn" id="spd30" onclick="setSpeed(30)">30×</button>
     &nbsp;
+    <button class="btn act" id="btnCad" onclick="toggleCad()" title="Toggle Channel Activity Detection — disable to see collisions">CAD: ON</button>
+    &nbsp;
     <button class="btn" id="btnPause" onclick="togglePause()">⏸ Pause</button>
     <button class="btn" onclick="resetSim()">↺ Reset</button>
   </div>
@@ -97,6 +99,13 @@ body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-s
     <div class="f"><span class="fl">Tank mode</span><span class="fv" id="gw-mode">—</span></div>
     <div class="f"><span class="fl">Pond pump</span><span class="fv" id="gw-pp">—</span></div>
 
+    <div class="f"><span class="fl">Auto-intelligence</span><span class="fv" id="gw-auto">OFF</span></div>
+    <div class="f"><span class="fl">Packets TX / RX</span><span class="fv" id="gw-stat">0 / 0</span></div>
+
+    <div class="cmdsec">
+      <div class="ctitle">Gateway Auto-Intelligence</div>
+      <button class="bcmd" id="gw-auto-btn" onclick="gwToggleAuto()">Enable GW Auto-React to Telemetry</button>
+    </div>
     <div class="cmdsec">
       <div class="ctitle">Commands → Tank (0x02)</div>
       <button class="bcmd" onclick="gwTankAuto(true)">→ Tank: Switch to AUTO mode</button>
@@ -148,6 +157,7 @@ body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-s
     <div class="f"><span class="fl">Replenish runon</span><span class="fv" id="tk-ro">inactive</span></div>
     <div class="f"><span class="fl">Next telemetry in</span><span class="fv" id="tk-tel">—</span></div>
     <div class="f"><span class="fl">TX queue depth</span><span class="fv" id="tk-q">0</span></div>
+    <div class="f"><span class="fl">Packets TX / RX</span><span class="fv" id="tk-stat">0 / 0</span></div>
 
     <div class="cmdsec">
       <div class="ctitle">Tank Local — Mode</div>
@@ -189,6 +199,7 @@ body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-s
     <div class="f"><span class="fl">Telemetry target</span><span class="fv">BROADCAST (0xFF) → GW + Tank</span></div>
 
     <div class="f"><span class="fl">TX queue depth</span><span class="fv" id="pd-q">0</span></div>
+    <div class="f"><span class="fl">Packets TX / RX</span><span class="fv" id="pd-stat">0 / 0</span></div>
 
     <div class="cmdsec">
       <div class="ctitle">Pond Local — Pump (manual override)</div>
@@ -215,7 +226,16 @@ body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-s
 <div class="logsec">
   <div class="logtitle">
     <span>EVENT LOG — Real-time LoRa communication trace</span>
-    <button class="btn" style="font-size:10px;padding:3px 8px" onclick="document.getElementById('log').innerHTML=''">CLEAR</button>
+    <div class="cg">
+      <span class="clbl">FILTER:</span>
+      <button class="btn act" id="lf-all"  onclick="setLogFilter('all')">All</button>
+      <button class="btn"     id="lf-gw"   onclick="setLogFilter('gw')">GW</button>
+      <button class="btn"     id="lf-tank" onclick="setLogFilter('tank')">Tank</button>
+      <button class="btn"     id="lf-pond" onclick="setLogFilter('pond')">Pond</button>
+      <button class="btn"     id="lf-warn" onclick="setLogFilter('warn')">Warn</button>
+      &nbsp;
+      <button class="btn" onclick="clearLog()">Clear</button>
+    </div>
   </div>
   <div id="log"></div>
 </div>
@@ -317,6 +337,9 @@ function resetSim() {
     packets: [],
     pkId: 0,
 
+    cadEnabled: true,   // CAD: channel activity detection before TX
+    logFilter: 'all',   // 'all' | 'gw' | 'tank' | 'pond' | 'warn'
+
     // ── Shared LoRa channel (868 MHz, half-duplex) ─────────────────────────
     // Only ONE device can transmit at a time. If a second device tries to TX
     // while the channel is busy, its packet is queued and sent as soon as the
@@ -331,6 +354,9 @@ function resetSim() {
     gw: {
       lastTankTel: null,
       lastPondTel: null,
+      autoMode: false,      // auto-react to telemetry like real firmware
+      autoCooldown: 0,      // simTime before next auto-command
+      txCount: 0, rxCount: 0,
     },
 
     tank: {
@@ -360,6 +386,7 @@ function resetSim() {
 
       errorCode: 0,
       fillCycles: 0,
+      txCount: 0, rxCount: 0,
     },
 
     pond: {
@@ -369,13 +396,26 @@ function resetSim() {
       telInterval: 10,
       lastCmdAt: -1,
       lastCmdSrc: '',
+      txCount: 0, rxCount: 0,
     },
   };
 
   setSpeedUI(10);
+  // Reset CAD button state
+  const cadBtn = document.getElementById('btnCad');
+  if (cadBtn) { cadBtn.textContent = 'CAD: ON'; cadBtn.className = 'btn act'; }
+  // Reset log filter buttons
+  ['all','gw','tank','pond','warn'].forEach(n => {
+    const el = document.getElementById('lf-' + n);
+    if (el) el.className = 'btn' + (n === 'all' ? ' act' : '');
+  });
+  // Reset GW auto button
+  const gwBtn = document.getElementById('gw-auto-btn');
+  if (gwBtn) gwBtn.textContent = 'Enable GW Auto-React to Telemetry';
+  clearLog();
   addLog('sys', 'Simulation started. Tank starts FULL, AUTO mode enabled.');
   addLog('sys', 'Tank will drain slowly. When empty it auto-requests pond pump ON.');
-  addLog('sys', 'Channel arbitration: only one node transmits at a time — others queue.');
+  addLog('sys', 'Channel arbitration active — CAD prevents collisions. Toggle CAD OFF to see collisions.');
   renderUI();
 }
 
@@ -409,6 +449,7 @@ function startTransmit(fromKey, toKey, msgType, desc, isBroadcast) {
   const realNow = performance.now();
   S.channel.freeAt   = realNow + AIR_TIME_MS;
   S.channel.busyNode = fromKey;
+  if (S[fromKey]) S[fromKey].txCount++;
 
   if (isBroadcast) {
     // One over-the-air transmission; every other node receives it.
@@ -430,16 +471,31 @@ function startTransmit(fromKey, toKey, msgType, desc, isBroadcast) {
 //   • Channel busy  → log "CAD detected", add random jitter, queue the packet
 function tryTransmit(fromKey, toKey, msgType, desc, isBroadcast = false) {
   const realNow = performance.now();
-  if (realNow >= S.channel.freeAt) {
-    // CAD: clear — transmit now
+  const channelFree = realNow >= S.channel.freeAt;
+
+  if (channelFree) {
     startTransmit(fromKey, toKey, msgType, desc, isBroadcast);
+  } else if (!S.cadEnabled) {
+    // CAD disabled — transmit into busy channel → COLLISION
+    addLog('warn', `💥 COLLISION: ${fromKey.toUpperCase()} TX while ${S.channel.busyNode||'?'} still transmitting — both packets LOST (enable CAD to prevent this)`);
+    // Mark all in-flight undelivered packets as collided
+    for (const p of S.packets) { if (!p.delivered) p.collided = true; }
+    // Spawn the colliding packet visually (also collided)
+    const realNow2 = performance.now();
+    S.channel.freeAt   = realNow2 + AIR_TIME_MS;
+    S.channel.busyNode = fromKey;
+    const targets = isBroadcast ? ['gw','tank','pond'].filter(k=>k!==fromKey) : [toKey];
+    for (const tk of targets) {
+      S.packets.push({ id: S.pkId++, fromKey, toKey: tk, msgType, desc,
+        startReal: realNow2, durMs: AIR_TIME_MS, delivered: false, collided: true });
+    }
   } else {
     // CAD: activity detected — back off then retry
-    const backoffMs = 100 + Math.random() * 400;            // 100–500 ms random
-    const notBefore = S.channel.freeAt + backoffMs;         // wait until clear + jitter
+    const backoffMs = 100 + Math.random() * 400;
+    const notBefore = S.channel.freeAt + backoffMs;
     S.txQueue.push({ fromKey, toKey, msgType, desc, isBroadcast, notBefore });
     addLog('warn',
-      `${fromKey.toUpperCase()} CAD: channel activity detected — [${MSG_NAME[msgType]}] backing off ${Math.round(backoffMs)} ms (queue: ${S.txQueue.length})`);
+      `${fromKey.toUpperCase()} CAD: channel busy — [${MSG_NAME[msgType]}] backing off ${Math.round(backoffMs)} ms (queue: ${S.txQueue.length})`);
   }
 }
 
@@ -497,7 +553,16 @@ function tankCmdPond(wantOn) {
 // =============================================================================
 
 function deliverPacket(pkt) {
+  if (pkt.collided) return; // packet was in a collision — not received by anyone
+
   const now = S.simTime;
+  // Simulate realistic RF link metrics
+  const rssi = -(70 + Math.floor(Math.random() * 45)); // -70 to -115 dBm
+  const snr  = 10 - Math.floor(Math.random() * 22);    // -12 to +10 dB
+  const rf   = `[RSSI ${rssi}dBm SNR ${snr>0?'+':''}${snr}dB]`;
+
+  // Track RX counts
+  if (S[pkt.toKey]) S[pkt.toKey].rxCount++;
 
   // ---------- TANK receives ----------
   if (pkt.toKey === 'tank') {
@@ -508,37 +573,36 @@ function deliverPacket(pkt) {
       if (S.tank.pondCmdPending) {
         if (S.pond.pumpOn === S.tank.pondCmdExpected) {
           S.tank.pondCmdPending = false;
-          addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'} ✓ CONFIRMED (command acknowledged via telemetry)`);
+          addLog('tank',`RX TELEMETRY from Pond ${rf} | pondPump=${S.pond.pumpOn?'ON':'off'} ✓ CONFIRMED`);
         } else {
-          addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'} ✗ mismatch — still waiting...`);
+          addLog('tank',`RX TELEMETRY from Pond ${rf} | pondPump=${S.pond.pumpOn?'ON':'off'} ✗ mismatch — waiting...`);
         }
       } else {
-        addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'}`);
+        addLog('tank',`RX TELEMETRY from Pond ${rf} | pondPump=${S.pond.pumpOn?'ON':'off'}`);
       }
     }
     else if (pkt.msgType === MSG_COMMAND && pkt.fromKey === 'gw') {
-      // Gateway commands are ALWAYS obeyed — no auto-mode check
       S.tank.lastGwContact = now;
       if (pkt.desc.includes('AUTO')) {
         S.tank.autoMode = true;
-        addLog('tank',`RX COMMAND from Gateway | → AUTO mode [gateway is master — always obeyed]`);
+        addLog('tank',`RX COMMAND from Gateway ${rf} | → AUTO mode [master — always obeyed]`);
       } else if (pkt.desc.includes('MANUAL')) {
         S.tank.autoMode = false;
-        addLog('tank',`RX COMMAND from Gateway | → MANUAL mode [gateway is master — always obeyed]`);
-      } else if (pkt.desc.includes('P1:ON'))  { S.tank.p1 = true;  addLog('tank','RX COMMAND from Gateway | P1 → ON'); }
-      else if (pkt.desc.includes('P1:OFF')) { S.tank.p1 = false; addLog('tank','RX COMMAND from Gateway | P1 → OFF'); }
-      else if (pkt.desc.includes('P2:ON'))  { S.tank.p2 = true;  addLog('tank','RX COMMAND from Gateway | P2 → ON'); }
-      else if (pkt.desc.includes('P2:OFF')) { S.tank.p2 = false; addLog('tank','RX COMMAND from Gateway | P2 → OFF'); }
+        addLog('tank',`RX COMMAND from Gateway ${rf} | → MANUAL mode [master — always obeyed]`);
+      } else if (pkt.desc.includes('P1:ON'))  { S.tank.p1 = true;  addLog('tank',`RX COMMAND from Gateway ${rf} | P1 → ON`); }
+      else if (pkt.desc.includes('P1:OFF')) { S.tank.p1 = false; addLog('tank',`RX COMMAND from Gateway ${rf} | P1 → OFF`); }
+      else if (pkt.desc.includes('P2:ON'))  { S.tank.p2 = true;  addLog('tank',`RX COMMAND from Gateway ${rf} | P2 → ON`); }
+      else if (pkt.desc.includes('P2:OFF')) { S.tank.p2 = false; addLog('tank',`RX COMMAND from Gateway ${rf} | P2 → OFF`); }
     }
     else if (pkt.msgType === MSG_CONFIG_GET && pkt.fromKey === 'gw') {
       S.tank.lastGwContact = now;
-      addLog('tank',`RX CONFIG_GET from Gateway | sending CONFIG_RESP`);
+      addLog('tank',`RX CONFIG_GET from Gateway ${rf} | sending CONFIG_RESP`);
       tryTransmit('tank','gw', MSG_CONFIG_RSP,
         `CONFIG_RESP | tel_interval=10s | net_timeout=60s | cmd_resp_timeout=15s | boot_auto=1`);
     }
     else if (pkt.msgType === MSG_STATS_GET && pkt.fromKey === 'gw') {
       S.tank.lastGwContact = now;
-      addLog('tank',`RX STATS_GET from Gateway | sending STATS_RESP`);
+      addLog('tank',`RX STATS_GET from Gateway ${rf} | sending STATS_RESP`);
       tryTransmit('tank','gw', MSG_STATS_RSP,
         `STATS_RESP | fill_cycles=${S.tank.fillCycles} | uptime=${Math.floor(now)}s`);
     }
@@ -548,17 +612,17 @@ function deliverPacket(pkt) {
   if (pkt.toKey === 'gw') {
     if (pkt.msgType === MSG_TELEMETRY && pkt.fromKey === 'tank') {
       S.gw.lastTankTel = { at: now, water: S.tank.waterDisc, auto: S.tank.autoMode, p1:S.tank.p1, p2:S.tank.p2, p3:S.tank.p3 };
-      addLog('gw',`RX TELEMETRY from Tank | water=${S.tank.waterDisc}/3 | ${S.tank.autoMode?'AUTO':'MANUAL'}`);
+      addLog('gw',`RX TELEMETRY from Tank ${rf} | water=${S.tank.waterDisc}/3 | ${S.tank.autoMode?'AUTO':'MANUAL'}`);
     }
     else if (pkt.msgType === MSG_TELEMETRY && pkt.fromKey === 'pond') {
       S.gw.lastPondTel = { at: now, pump: S.pond.pumpOn };
-      addLog('gw',`RX TELEMETRY from Pond [broadcast] | pondPump=${S.pond.pumpOn?'ON':'off'}`);
+      addLog('gw',`RX TELEMETRY from Pond ${rf} [broadcast] | pondPump=${S.pond.pumpOn?'ON':'off'}`);
     }
     else if (pkt.msgType === MSG_CONFIG_RSP) {
-      addLog('gw',`RX CONFIG_RESP from Tank | ${pkt.desc.replace('CONFIG_RESP | ','')}`);
+      addLog('gw',`RX CONFIG_RESP from Tank ${rf} | ${pkt.desc.replace('CONFIG_RESP | ','')}`);
     }
     else if (pkt.msgType === MSG_STATS_RSP) {
-      addLog('gw',`RX STATS_RESP from Tank | ${pkt.desc.replace('STATS_RESP | ','')}`);
+      addLog('gw',`RX STATS_RESP from Tank ${rf} | ${pkt.desc.replace('STATS_RESP | ','')}`);
     }
   }
 
@@ -568,7 +632,7 @@ function deliverPacket(pkt) {
     S.pond.pumpOn    = wantOn;
     S.pond.lastCmdAt = S.simTime;
     S.pond.lastCmdSrc = pkt.fromKey === 'gw' ? 'Gateway' : 'Tank';
-    addLog('pond',`RX COMMAND from ${S.pond.lastCmdSrc} | pondPump → ${wantOn?'ON':'off'} | will confirm in next telemetry broadcast`);
+    addLog('pond',`RX COMMAND from ${S.pond.lastCmdSrc} ${rf} | pondPump → ${wantOn?'ON':'off'} | confirms via next telemetry`);
   }
 }
 
@@ -653,6 +717,9 @@ function update(realNow) {
     pondSendTelemetry();
   }
 
+  // ── Gateway auto-intelligence ──────────────────────────────────────────────
+  if (S.gw.autoMode) gwAutoReact();
+
   // ── Network timeout check ──────────────────────────────────────────────────
   T.errorCode = (now - T.lastGwContact > T.networkTimeout) ? 3 : 0;
 
@@ -671,6 +738,77 @@ function update(realNow) {
   // ── Channel arbitration ────────────────────────────────────────────────────
   if (realNowMs >= S.channel.freeAt) S.channel.busyNode = null;
   processTxQueue(); // send next queued packet if channel is now free
+}
+
+// =============================================================================
+// GATEWAY AUTO-INTELLIGENCE
+// =============================================================================
+
+// Mirrors how the real gateway firmware reacts to incoming telemetry.
+// Enabled/disabled via the "GW Auto-React" toggle button.
+function gwAutoReact() {
+  const G = S.gw;
+  if (!G.lastTankTel || !G.lastPondTel) return;
+  if (S.simTime < G.autoCooldown) return;
+
+  const water  = G.lastTankTel.water;
+  const pumpOn = G.lastPondTel.pump;
+
+  if (water === 0 && !pumpOn) {
+    addLog('gw', 'AUTO: water=0/3 in tank telemetry → commanding pond pump ON');
+    gwPond(true);
+    G.autoCooldown = S.simTime + 20; // 20s sim cooldown before next auto-command
+  } else if (water >= 3 && pumpOn) {
+    addLog('gw', 'AUTO: tank full (3/3) → commanding pond pump OFF');
+    gwPond(false);
+    G.autoCooldown = S.simTime + 20;
+  }
+}
+
+function gwToggleAuto() {
+  S.gw.autoMode = !S.gw.autoMode;
+  S.gw.autoCooldown = 0;
+  const btn = document.getElementById('gw-auto-btn');
+  if (btn) btn.textContent = S.gw.autoMode ? 'Disable GW Auto-React' : 'Enable GW Auto-React to Telemetry';
+  addLog('gw', `Gateway auto-intelligence ${S.gw.autoMode ? 'ENABLED — will react to tank/pond telemetry' : 'DISABLED'}`);
+}
+
+// =============================================================================
+// CAD TOGGLE
+// =============================================================================
+
+function toggleCad() {
+  S.cadEnabled = !S.cadEnabled;
+  const btn = document.getElementById('btnCad');
+  if (btn) {
+    btn.textContent = `CAD: ${S.cadEnabled ? 'ON' : 'OFF'}`;
+    btn.className = S.cadEnabled ? 'btn act' : 'btn';
+  }
+  addLog('sys', S.cadEnabled
+    ? 'CAD ENABLED — nodes listen before TX; collisions prevented'
+    : 'CAD DISABLED — nodes TX without checking; simultaneous TX will cause collision!');
+}
+
+// =============================================================================
+// LOG FILTER + CLEAR
+// =============================================================================
+
+function setLogFilter(f) {
+  S.logFilter = f;
+  const logEl = document.getElementById('log');
+  for (const p of logEl.children) {
+    const t = p.getAttribute('data-type') || 'sys';
+    p.style.display = (f === 'all' || t === f) ? '' : 'none';
+  }
+  ['all','gw','tank','pond','warn'].forEach(n => {
+    const el = document.getElementById('lf-' + n);
+    if (el) el.className = 'btn' + (n === f ? ' act' : '');
+  });
+}
+
+function clearLog() {
+  const logEl = document.getElementById('log');
+  while (logEl.firstChild) logEl.removeChild(logEl.firstChild);
 }
 
 // =============================================================================
@@ -789,10 +927,12 @@ function addLog(type, msg) {
   const srcLabel = {tank:'[TANK]', pond:'[POND]', gw:'[GW  ]', warn:'[WARN]', sys:'[SYS ]'}[type] || '[???]';
   const p = document.createElement('p');
   p.className = 'le';
+  p.setAttribute('data-type', type);
   p.innerHTML = `<span class="lt">${t.padStart(8,'0')}s </span><span class="${cls}">${srcLabel} ${escHtml(msg)}</span>`;
+  // Apply active log filter
+  if (S.logFilter && S.logFilter !== 'all' && type !== S.logFilter) p.style.display = 'none';
   logEl.appendChild(p);
-  // Keep max 200 entries
-  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+  while (logEl.children.length > 300) logEl.removeChild(logEl.firstChild);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
@@ -887,7 +1027,14 @@ function renderUI() {
   setTxt('pd-tel', nextPdTel + 's');
   setTxt('pd-q', String(S.txQueue.filter(p => p.fromKey === 'pond').length));
 
+  setTxt('tk-stat', `${T.txCount} TX / ${T.rxCount} RX`);
+  setTxt('pd-stat', `${P.txCount} TX / ${P.rxCount} RX`);
+
   // Gateway panel
+  setTxt('gw-auto', G.autoMode ? 'ON — reacting to telemetry' : 'OFF');
+  setCls('gw-auto', G.autoMode ? 'fon' : 'foff');
+  setTxt('gw-stat', `${G.txCount} TX / ${G.rxCount} RX`);
+
   if (G.lastTankTel) {
     setTxt('gw-lt', `${G.lastTankTel.at.toFixed(1)}s ago`);
     setTxt('gw-wl', `${G.lastTankTel.water}/3`);
@@ -1011,36 +1158,49 @@ function drawPacket(pkt) {
   const p0 = np(pkt.fromKey), p1 = cp(pkt.fromKey, pkt.toKey), p2 = np(pkt.toKey);
   const pos = bezier(pkt.progress, p0, p1, p2);
 
-  // Fade out after delivery
   const age = performance.now() - pkt.startReal;
   const alpha = pkt.delivered ? Math.max(0, 1 - (age - pkt.durMs) / 1500) : 1;
-
-  const color = MSG_COLOR[pkt.msgType] || '#ffffff';
-  const r = 7;
 
   ctx.save();
   ctx.globalAlpha = alpha;
 
-  // Glow
-  ctx.shadowColor = color;
-  ctx.shadowBlur  = 12;
-  ctx.fillStyle   = color;
-  ctx.beginPath();
-  ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
-  ctx.fill();
+  if (pkt.collided) {
+    // Collided packet — draw as red X
+    const r = 8;
+    ctx.shadowColor = '#e02020';
+    ctx.shadowBlur  = 14;
+    ctx.strokeStyle = '#e02020';
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(pos.x - r, pos.y - r); ctx.lineTo(pos.x + r, pos.y + r);
+    ctx.moveTo(pos.x + r, pos.y - r); ctx.lineTo(pos.x - r, pos.y + r);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.font = '9px Courier New';
+    ctx.fillStyle = '#e02020';
+    ctx.textAlign = 'center';
+    ctx.fillText('💥LOST', pos.x, pos.y - 13);
+  } else {
+    const color = MSG_COLOR[pkt.msgType] || '#6090b0';
+    const r = 7;
+    ctx.shadowColor = color;
+    ctx.shadowBlur  = 12;
+    ctx.fillStyle   = color;
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
+    ctx.fill();
 
-  // Inner dot
-  ctx.shadowBlur = 0;
-  ctx.fillStyle  = 'rgba(255,255,255,0.85)';
-  ctx.beginPath();
-  ctx.arc(pos.x, pos.y, 2.5, 0, Math.PI*2);
-  ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle  = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, 2.5, 0, Math.PI*2);
+    ctx.fill();
 
-  // Label
-  ctx.font = '9px Courier New';
-  ctx.fillStyle = color;
-  ctx.textAlign = 'center';
-  ctx.fillText(MSG_NAME[pkt.msgType] || '?', pos.x, pos.y - 11);
+    ctx.font = '9px Courier New';
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.fillText(MSG_NAME[pkt.msgType] || '?', pos.x, pos.y - 11);
+  }
 
   ctx.restore();
 }
