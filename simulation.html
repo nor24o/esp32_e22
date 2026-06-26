@@ -147,6 +147,28 @@ body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-s
     <div class="f"><span class="fl">Fill cycles (auto)</span><span class="fv" id="tk-fc">0</span></div>
     <div class="f"><span class="fl">Replenish runon</span><span class="fv" id="tk-ro">inactive</span></div>
     <div class="f"><span class="fl">Next telemetry in</span><span class="fv" id="tk-tel">—</span></div>
+    <div class="f"><span class="fl">TX queue depth</span><span class="fv" id="tk-q">0</span></div>
+
+    <div class="cmdsec">
+      <div class="ctitle">Tank Local — Mode</div>
+      <button class="bcmd pon" onclick="tankSetMode(true)">Switch to AUTO mode</button>
+      <button class="bcmd" onclick="tankSetMode(false)">Switch to MANUAL mode</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Tank Local — Pumps P1/P2/P3 (manual only)</div>
+      <button class="bcmd" onclick="tankToggleP(1)">Toggle P1</button>
+      <button class="bcmd" onclick="tankToggleP(2)">Toggle P2</button>
+      <button class="bcmd" onclick="tankToggleP(3)">Toggle P3</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Tank → Pond Commands</div>
+      <button class="bcmd pon" onclick="tankCmdPondDirect(true)">→ Pond: Pump ON</button>
+      <button class="bcmd poff" onclick="tankCmdPondDirect(false)">→ Pond: Pump OFF</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Tank → Gateway</div>
+      <button class="bcmd" onclick="tankForceTel()">Force telemetry TX now</button>
+    </div>
   </div>
 
   <!-- POND -->
@@ -166,12 +188,24 @@ body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-s
     <div class="f"><span class="fl">Next telemetry in</span><span class="fv" id="pd-tel">—</span></div>
     <div class="f"><span class="fl">Telemetry target</span><span class="fv">BROADCAST (0xFF) → GW + Tank</span></div>
 
+    <div class="f"><span class="fl">TX queue depth</span><span class="fv" id="pd-q">0</span></div>
+
+    <div class="cmdsec">
+      <div class="ctitle">Pond Local — Pump (manual override)</div>
+      <button class="bcmd pon" onclick="pondLocalPump(true)">Pump ON (local override)</button>
+      <button class="bcmd poff" onclick="pondLocalPump(false)">Pump OFF (local override)</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Pond → All (broadcast)</div>
+      <button class="bcmd" onclick="pondForceTel()">Force telemetry broadcast now</button>
+    </div>
+
     <div style="margin-top:10px;padding:8px;background:#081e10;border:1px solid #153020;border-radius:4px;font-size:11px;color:#50a868;line-height:1.7">
       <div style="color:#306848;margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;font-size:10px">Pond Behavior</div>
       ↪ Receives pump ON/OFF from Tank or Gateway<br>
       ↪ No ACK sent — confirms via next telemetry<br>
       ↪ Broadcasts telemetry every 10 sim-s (both GW and Tank receive it)<br>
-      ↪ Also communicates directly with Gateway independently
+      ↪ CAD scan before every TX — backs off if channel busy
     </div>
   </div>
 
@@ -385,27 +419,45 @@ function startTransmit(fromKey, toKey, msgType, desc, isBroadcast) {
   }
 }
 
-// Request a transmission. If the channel is free, transmit immediately.
-// If busy, put the request in the queue — it will fire once the channel clears.
+// Request a transmission, simulating CAD (Channel Activity Detection).
+//
+// CAD in real hardware: before TX, the chip listens for ~a few ms to detect
+// whether another node's LoRa preamble is on the air. If busy → back off a
+// random 100–500 ms and retry. This prevents both packets being destroyed.
+//
+// In the simulation CAD is modelled as:
+//   • Channel free  → transmit immediately (CAD takes ~0 sim-time)
+//   • Channel busy  → log "CAD detected", add random jitter, queue the packet
 function tryTransmit(fromKey, toKey, msgType, desc, isBroadcast = false) {
   const realNow = performance.now();
   if (realNow >= S.channel.freeAt) {
+    // CAD: clear — transmit now
     startTransmit(fromKey, toKey, msgType, desc, isBroadcast);
   } else {
-    const waitSec = ((S.channel.freeAt - realNow) / 1000).toFixed(2);
-    S.txQueue.push({ fromKey, toKey, msgType, desc, isBroadcast });
-    addLog('warn', `${fromKey.toUpperCase()} channel busy (${waitSec}s) — [${MSG_NAME[msgType]}] queued (queue depth: ${S.txQueue.length})`);
+    // CAD: activity detected — back off then retry
+    const backoffMs = 100 + Math.random() * 400;            // 100–500 ms random
+    const notBefore = S.channel.freeAt + backoffMs;         // wait until clear + jitter
+    S.txQueue.push({ fromKey, toKey, msgType, desc, isBroadcast, notBefore });
+    addLog('warn',
+      `${fromKey.toUpperCase()} CAD: channel activity detected — [${MSG_NAME[msgType]}] backing off ${Math.round(backoffMs)} ms (queue: ${S.txQueue.length})`);
   }
 }
 
-// Called every frame: if the channel just became free, transmit the next queued packet.
+// Called every frame: fire the next queued packet once the channel is free
+// AND the packet's backoff delay has elapsed.
 function processTxQueue() {
   if (S.txQueue.length === 0) return;
   const realNow = performance.now();
   if (realNow < S.channel.freeAt) return;
 
+  // Sort so the packet with the earliest notBefore fires first
+  S.txQueue.sort((a, b) => a.notBefore - b.notBefore);
+  if (realNow < S.txQueue[0].notBefore) return; // backoff still running
+
   const next = S.txQueue.shift();
-  addLog('warn', `${next.fromKey.toUpperCase()} dequeuing [${MSG_NAME[next.msgType]}] — channel free now (${S.txQueue.length} still queued)`);
+  const remaining = S.txQueue.length;
+  addLog('warn',
+    `${next.fromKey.toUpperCase()} CAD clear — transmitting dequeued [${MSG_NAME[next.msgType]}]${remaining ? ` (${remaining} still queued)` : ''}`);
   startTransmit(next.fromKey, next.toKey, next.msgType, next.desc, next.isBroadcast);
 }
 
@@ -654,6 +706,57 @@ function gwStatsGet() {
 }
 
 // =============================================================================
+// TANK LOCAL CONTROLS
+// =============================================================================
+
+function tankSetMode(auto) {
+  S.tank.autoMode = auto;
+  if (!auto) { S.tank.p1 = false; S.tank.p2 = false; S.tank.p3 = false; }
+  addLog('tank', `LOCAL: mode switched to ${auto ? 'AUTO' : 'MANUAL'}`);
+}
+
+function tankToggleP(n) {
+  if (S.tank.autoMode) {
+    addLog('warn', 'Tank: switch to MANUAL mode first before toggling pumps');
+    return;
+  }
+  S.tank['p' + n] = !S.tank['p' + n];
+  addLog('tank', `LOCAL: P${n} toggled → ${S.tank['p' + n] ? 'ON' : 'OFF'}`);
+}
+
+function tankForceTel() {
+  addLog('tank', 'LOCAL: force telemetry TX');
+  tankSendTelemetry();
+  S.tank.lastTelSent = S.simTime; // reset the periodic timer
+}
+
+function tankCmdPondDirect(wantOn) {
+  if (S.tank.pondCmdPending) {
+    addLog('warn', 'Tank: already waiting for pond confirmation — command ignored');
+    return;
+  }
+  addLog('tank', `LOCAL: manually commanding pond pump ${wantOn ? 'ON' : 'OFF'}`);
+  tankCmdPond(wantOn);
+}
+
+// =============================================================================
+// POND LOCAL CONTROLS
+// =============================================================================
+
+function pondLocalPump(wantOn) {
+  S.pond.pumpOn    = wantOn;
+  S.pond.lastCmdAt  = S.simTime;
+  S.pond.lastCmdSrc = 'Local override';
+  addLog('pond', `LOCAL: pump manually set ${wantOn ? 'ON' : 'OFF'} (no LoRa — local button/override)`);
+}
+
+function pondForceTel() {
+  addLog('pond', 'LOCAL: force telemetry broadcast');
+  pondSendTelemetry();
+  S.pond.lastTelSent = S.simTime;
+}
+
+// =============================================================================
 // SPEED / PAUSE CONTROLS
 // =============================================================================
 
@@ -770,6 +873,7 @@ function renderUI() {
 
   const nextTel = Math.max(0, T.lastTelSent + T.telInterval - now).toFixed(1);
   setTxt('tk-tel', nextTel + 's');
+  setTxt('tk-q', String(S.txQueue.filter(p => p.fromKey === 'tank').length));
 
   // Pond panel
   const pumpOn = P.pumpOn;
@@ -781,6 +885,7 @@ function renderUI() {
   setTxt('pd-src', P.lastCmdSrc || '—');
   const nextPdTel = Math.max(0, P.lastTelSent + P.telInterval - now).toFixed(1);
   setTxt('pd-tel', nextPdTel + 's');
+  setTxt('pd-q', String(S.txQueue.filter(p => p.fromKey === 'pond').length));
 
   // Gateway panel
   if (G.lastTankTel) {

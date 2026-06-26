@@ -27,6 +27,16 @@ void IRAM_ATTR onPacketReceived() {
 //          This task dequeues them and transmits one at a time.
 //          After each TX the radio is put back into receive mode.
 //
+//          Before every transmission this task performs a CAD scan
+//          (Channel Activity Detection).  CAD takes ~a few milliseconds:
+//          the SX1262 listens for a LoRa preamble on the channel and
+//          reports whether another node is already transmitting.
+//          If the channel is busy the packet is re-queued and we back off
+//          for a random 100–500 ms, preventing a collision that would
+//          corrupt both packets.  If CAD itself fails for any reason we
+//          transmit anyway (fail-open) so a single bad CAD result does
+//          not permanently block the queue.
+//
 // RX side: the DIO1 ISR (above) signals xLoRaIrqSemaphore when a packet arrives.
 //          This task reads the packet, validates the header, and puts it into
 //          xRxQueue for the ControlEngine task to process.
@@ -60,6 +70,27 @@ static void Task_LoRaTransceiver(void *pvParams) {
             Serial.printf("\n[LoRa] TX type=%u → 0x%02X (%u bytes)... ",
                           txPkt.header.msg_type, txPkt.header.target_id,
                           (unsigned)sizeof(LoRaPacket));
+
+            // ── CAD: listen before talk ───────────────────────────────────
+            // scanChannel() makes the SX1262 perform a Channel Activity
+            // Detection scan (~a few ms).  Returns RADIOLIB_LORA_DETECTED
+            // if another node's preamble is on the air right now.
+            int cadResult = radio.scanChannel();
+            if (cadResult == RADIOLIB_LORA_DETECTED) {
+                uint32_t backoffMs = 100 + (esp_random() % 400); // 100–500 ms
+                Serial.printf("CAD: channel busy — backoff %lu ms\n", backoffMs);
+                // Put the packet back at the front of the queue so it is
+                // sent before any newer packets that arrive during the wait.
+                xQueueSendToFront(xTxQueue, &txPkt, 0);
+                radio.startReceive();          // keep listening while we wait
+                vTaskDelay(pdMS_TO_TICKS(backoffMs));
+                continue;                      // restart the loop iteration
+            }
+            if (cadResult != RADIOLIB_ERR_NONE) {
+                // CAD itself failed (wiring glitch, etc.) — transmit anyway
+                // rather than permanently blocking the queue.
+                Serial.printf("CAD failed (code=%d) — transmitting anyway\n", cadResult);
+            }
 
             // startTransmit() begins the transmission and returns immediately.
             // The CPU yields via xSemaphoreTake while the ~415 ms air time elapses.
