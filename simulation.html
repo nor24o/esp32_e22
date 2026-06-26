@@ -6,58 +6,58 @@
 <title>ESP32 LoRa System — Full Simulator</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-size:13px;overflow-x:hidden}
-.hdr{background:#0c1930;border-bottom:2px solid #1b3968;padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.htitle{color:#6ab0ff;font-size:15px;font-weight:bold;letter-spacing:.5px}
-.hsub{color:#3a6080;font-size:11px;margin-top:2px}
+body{font-family:'Courier New',monospace;background:#f2f5fa;color:#2c3e50;font-size:13px;overflow-x:hidden}
+.hdr{background:#ffffff;border-bottom:2px solid #c8d8ea;padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.htitle{color:#1a5fb4;font-size:15px;font-weight:bold;letter-spacing:.5px}
+.hsub{color:#7a8fa8;font-size:11px;margin-top:2px}
 .cg{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.clbl{color:#3a6080;font-size:11px}
-.btn{background:#111e34;border:1px solid #253a68;color:#6a9cd0;padding:5px 11px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:12px;transition:background .15s}
-.btn:hover{background:#1a2e50}
-.btn.act{background:#154085;border-color:#3070c0;color:#c0dfff}
-#cv{display:block;width:100%;background:#050d1a;border-bottom:1px solid #162540;cursor:default}
-.pnls{display:flex;gap:8px;padding:8px;background:#050d1a}
-.pnl{flex:1;background:#0b1828;border:1px solid #1b2f50;border-radius:4px;padding:10px;min-width:0}
-.ptitle{font-size:13px;font-weight:bold;padding-bottom:7px;margin-bottom:7px;border-bottom:1px solid #1b2f50;display:flex;align-items:center;gap:7px}
+.clbl{color:#7a8fa8;font-size:11px}
+.btn{background:#edf2f9;border:1px solid #bfcfdf;color:#2c5080;padding:5px 11px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:12px;transition:background .15s}
+.btn:hover{background:#dce8f5}
+.btn.act{background:#c5d9f0;border-color:#4080c0;color:#1a4080}
+#cv{display:block;width:100%;background:#e4ecf6;border-bottom:1px solid #c8d8ea;cursor:default}
+.pnls{display:flex;gap:8px;padding:8px;background:#e4ecf6}
+.pnl{flex:1;background:#ffffff;border:1px solid #c8d8ea;border-radius:4px;padding:10px;min-width:0}
+.ptitle{font-size:13px;font-weight:bold;padding-bottom:7px;margin-bottom:7px;border-bottom:1px solid #c8d8ea;display:flex;align-items:center;gap:7px}
 .pdot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
-.pgw .ptitle{color:#b070ff}.pgw .pdot{background:#b070ff;box-shadow:0 0 6px #b070ff}
-.ptank .ptitle{color:#50aaff}.ptank .pdot{background:#50aaff;box-shadow:0 0 6px #50aaff}
-.ppond .ptitle{color:#40d880}.ppond .pdot{background:#40d880;box-shadow:0 0 6px #40d880}
-.f{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #0c1828;font-size:12px}
-.fl{color:#3a6080}.fv{color:#90c0e0;font-weight:bold}
-.fon{color:#40e870!important}.foff{color:#203040!important}
-.fwarn{color:#ffa030!important}.ferr{color:#ff4030!important}
-.fpend{color:#ffa030!important;animation:blk .7s infinite}
+.pgw .ptitle{color:#7030c8}.pgw .pdot{background:#7030c8;box-shadow:0 0 5px #b070ff80}
+.ptank .ptitle{color:#1a72d0}.ptank .pdot{background:#1a72d0;box-shadow:0 0 5px #50aaff80}
+.ppond .ptitle{color:#18a050}.ppond .pdot{background:#18a050;box-shadow:0 0 5px #40d88080}
+.f{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #e8eff7;font-size:12px}
+.fl{color:#7a8fa8}.fv{color:#2c4060;font-weight:bold}
+.fon{color:#18a040!important}.foff{color:#9aacbc!important}
+.fwarn{color:#b05800!important}.ferr{color:#c01818!important}
+.fpend{color:#b05800!important;animation:blk .7s infinite}
 @keyframes blk{0%,100%{opacity:1}50%{opacity:.2}}
-.wtank{border:2px solid #1a5090;border-radius:4px 4px 6px 6px;height:68px;position:relative;overflow:hidden;background:#050f1e;margin:7px 0 3px}
-.wbody{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,#0048b8,#0070d8 50%,#1890f0);transition:height .4s linear}
-.wmarks{position:absolute;top:0;bottom:0;right:5px;display:flex;flex-direction:column;justify-content:space-around;font-size:9px;color:#285070;z-index:1;pointer-events:none}
+.wtank{border:2px solid #3080c0;border-radius:4px 4px 6px 6px;height:68px;position:relative;overflow:hidden;background:#e8f4fd;margin:7px 0 3px}
+.wbody{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,#1060d0,#2080e0 50%,#40a0f0);transition:height .4s linear}
+.wmarks{position:absolute;top:0;bottom:0;right:5px;display:flex;flex-direction:column;justify-content:space-around;font-size:9px;color:#6090b8;z-index:1;pointer-events:none}
 .wdashes{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;justify-content:space-around;z-index:1;pointer-events:none}
-.wd{border-top:1px dashed #0e2840;margin:0 2px}
-.wlbl{font-size:10px;color:#3a6080;text-align:center;margin-bottom:5px}
+.wd{border-top:1px dashed #b0cce0;margin:0 2px}
+.wlbl{font-size:10px;color:#7a8fa8;text-align:center;margin-bottom:5px}
 .pr{display:flex;gap:5px;margin:5px 0;flex-wrap:wrap}
-.pi{display:flex;align-items:center;gap:4px;background:#0a1520;border:1px solid #1a2a40;border-radius:3px;padding:4px 8px;font-size:11px}
-.pled{width:8px;height:8px;border-radius:50%;background:#182438}
-.pled.on{background:#38e060;box-shadow:0 0 7px #38e060}
-.pled.pw{background:#ffa030;animation:blk .7s infinite}
-.cmdsec{margin-top:8px;padding-top:8px;border-top:1px solid #1b2f50}
-.ctitle{font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}
-.bcmd{background:#0b1e38;border:1px solid #1e3a68;color:#6090c8;padding:5px 9px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:11px;margin:3px 0;display:block;width:100%;text-align:left;transition:background .15s}
-.bcmd:hover{background:#142840}
-.bcmd.pon{border-color:#1e6035;color:#40c870}.bcmd.pon:hover{background:#0e2818}
-.bcmd.poff{border-color:#602010;color:#c85040}.bcmd.poff:hover{background:#280808}
-.logsec{padding:8px;background:#050d1a;border-top:1px solid #162540}
-.logtitle{font-size:12px;color:#5090d0;padding-bottom:6px;border-bottom:1px solid #1b2f50;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
-#log{height:180px;overflow-y:auto;background:#040810;border:1px solid #162540;border-radius:3px;padding:6px;font-size:11px;line-height:1.7}
+.pi{display:flex;align-items:center;gap:4px;background:#f0f4fa;border:1px solid #bfcfdf;border-radius:3px;padding:4px 8px;font-size:11px}
+.pled{width:8px;height:8px;border-radius:50%;background:#c0ccd8}
+.pled.on{background:#18a040;box-shadow:0 0 6px #18a04080}
+.pled.pw{background:#d07010;animation:blk .7s infinite}
+.cmdsec{margin-top:8px;padding-top:8px;border-top:1px solid #c8d8ea}
+.ctitle{font-size:10px;color:#7a8fa8;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}
+.bcmd{background:#edf2f9;border:1px solid #bfcfdf;color:#2c5080;padding:5px 9px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:11px;margin:3px 0;display:block;width:100%;text-align:left;transition:background .15s}
+.bcmd:hover{background:#dce8f5}
+.bcmd.pon{border-color:#18a040;color:#18a040}.bcmd.pon:hover{background:#e8f8ee}
+.bcmd.poff{border-color:#c01818;color:#c01818}.bcmd.poff:hover{background:#faeae8}
+.logsec{padding:8px;background:#e4ecf6;border-top:1px solid #c8d8ea}
+.logtitle{font-size:12px;color:#3070c0;padding-bottom:6px;border-bottom:1px solid #c8d8ea;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+#log{height:180px;overflow-y:auto;background:#ffffff;border:1px solid #c8d8ea;border-radius:3px;padding:6px;font-size:11px;line-height:1.7}
 .le{margin:0;white-space:pre-wrap;word-break:break-all}
-.lt{color:#253848}.lgw{color:#9050f0}.ltk{color:#4090e0}.lpd{color:#38b870}.lwn{color:#e09030}.lsy{color:#304860}
-.protosec{padding:8px;background:#050d1a;border-top:1px solid #162540;display:flex;gap:10px;flex-wrap:wrap}
+.lt{color:#8090a8}.lgw{color:#6020c0}.ltk{color:#1060c0}.lpd{color:#188050}.lwn{color:#b05800}.lsy{color:#8090a8}
+.protosec{padding:8px;background:#e4ecf6;border-top:1px solid #c8d8ea;display:flex;gap:10px;flex-wrap:wrap}
 .pbox{flex:1;min-width:180px}
-.pbox h3{font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;padding-bottom:4px;margin-bottom:4px;border-bottom:1px solid #162540}
-.pitem{display:flex;align-items:center;gap:5px;font-size:11px;padding:2px 0;color:#7090b0}
+.pbox h3{font-size:10px;color:#7a8fa8;text-transform:uppercase;letter-spacing:1px;padding-bottom:4px;margin-bottom:4px;border-bottom:1px solid #c8d8ea}
+.pitem{display:flex;align-items:center;gap:5px;font-size:11px;padding:2px 0;color:#506080}
 .pdl{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.pkv{font-size:11px;color:#4a6a90;padding:1px 0}
-.pkv b{color:#8ab0cc;font-weight:normal}
+.pkv{font-size:11px;color:#6080a0;padding:1px 0}
+.pkv b{color:#304060;font-weight:normal}
 @media(max-width:720px){.pnls{flex-direction:column}.protosec{flex-direction:column}}
 </style>
 </head>
@@ -134,7 +134,7 @@ body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-s
     <div class="f"><span class="fl">Gateway last seen</span><span class="fv" id="tk-gwc">0s ago</span></div>
     <div class="f"><span class="fl">Pond last seen</span><span class="fv" id="tk-pdc">0s ago</span></div>
 
-    <div style="margin-top:6px;font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Local Pumps (P1/P2/P3)</div>
+    <div style="margin-top:6px;font-size:10px;color:#7a8fa8;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Local Pumps (P1/P2/P3)</div>
     <div class="pr">
       <div class="pi"><div class="pled" id="lp1"></div><span>P1</span></div>
       <div class="pi"><div class="pled" id="lp2"></div><span>P2</span></div>
@@ -200,8 +200,8 @@ body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-s
       <button class="bcmd" onclick="pondForceTel()">Force telemetry broadcast now</button>
     </div>
 
-    <div style="margin-top:10px;padding:8px;background:#081e10;border:1px solid #153020;border-radius:4px;font-size:11px;color:#50a868;line-height:1.7">
-      <div style="color:#306848;margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;font-size:10px">Pond Behavior</div>
+    <div style="margin-top:10px;padding:8px;background:#edf8f2;border:1px solid #a8d8bc;border-radius:4px;font-size:11px;color:#287848;line-height:1.7">
+      <div style="color:#1a6038;margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;font-size:10px">Pond Behavior</div>
       ↪ Receives pump ON/OFF from Tank or Gateway<br>
       ↪ No ACK sent — confirms via next telemetry<br>
       ↪ Broadcasts telemetry every 10 sim-s (both GW and Tank receive it)<br>
@@ -965,8 +965,8 @@ function drawNode(key, label, subLabel, color, extraLines) {
   // Shadow / glow
   ctx.save();
   ctx.shadowColor = color;
-  ctx.shadowBlur  = 16;
-  ctx.fillStyle   = '#0c1828';
+  ctx.shadowBlur  = 12;
+  ctx.fillStyle   = '#ffffff';
   ctx.beginPath();
   ctx.roundRect(x, y, W, H, r);
   ctx.fill();
@@ -991,14 +991,14 @@ function drawNode(key, label, subLabel, color, extraLines) {
   ctx.textAlign = 'center';
   ctx.fillText(label, p.x, y + 14);
 
-  ctx.fillStyle = '#5080a0';
+  ctx.fillStyle = '#6080a0';
   ctx.font = '10px Courier New';
   ctx.fillText(subLabel, p.x, y + 30);
 
   // Extra info lines
   const lineH = 13;
   extraLines.forEach((line, i) => {
-    ctx.fillStyle = line.color || '#7090b0';
+    ctx.fillStyle = line.color || '#5878a0';
     ctx.font = line.bold ? 'bold 11px Courier New' : '11px Courier New';
     ctx.fillText(line.text, p.x, y + 44 + i * lineH);
   });
@@ -1031,7 +1031,7 @@ function drawPacket(pkt) {
 
   // Inner dot
   ctx.shadowBlur = 0;
-  ctx.fillStyle  = '#ffffff';
+  ctx.fillStyle  = 'rgba(255,255,255,0.85)';
   ctx.beginPath();
   ctx.arc(pos.x, pos.y, 2.5, 0, Math.PI*2);
   ctx.fill();
@@ -1049,9 +1049,9 @@ function renderCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   // Background grid
-  ctx.fillStyle = '#050d1a';
+  ctx.fillStyle = '#e4ecf6';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = '#0a1628';
+  ctx.strokeStyle = '#d0dae8';
   ctx.lineWidth = 1;
   for (let x = 0; x < canvas.width; x += 40) {
     ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
@@ -1064,16 +1064,16 @@ function renderCanvas() {
   const pending = S.tank && S.tank.pondCmdPending;
 
   // Links
-  drawLink('gw','tank',   '#1a3060', 0.8, false);
-  drawLink('tank','gw',   '#1a3060', 0.8, false);
-  drawLink('gw','pond',   '#1a3060', 0.8, false);
-  drawLink('pond','gw',   '#1a3060', 0.8, false);
-  drawLink('tank','pond', pending ? '#ffa030' : '#1a3060', pending ? 0.7 : 0.8, pending);
-  drawLink('pond','tank', pending ? '#ffa030' : '#1a3060', pending ? 0.7 : 0.8, pending);
+  drawLink('gw','tank',   '#a0b8d0', 0.9, false);
+  drawLink('tank','gw',   '#a0b8d0', 0.9, false);
+  drawLink('gw','pond',   '#a0b8d0', 0.9, false);
+  drawLink('pond','gw',   '#a0b8d0', 0.9, false);
+  drawLink('tank','pond', pending ? '#d07010' : '#a0b8d0', pending ? 0.8 : 0.9, pending);
+  drawLink('pond','tank', pending ? '#d07010' : '#a0b8d0', pending ? 0.8 : 0.9, pending);
 
   // Link labels
   ctx.font = '9px Courier New';
-  ctx.fillStyle = '#2a4060';
+  ctx.fillStyle = '#8090a8';
   ctx.textAlign = 'center';
   const labPos = (k1,k2,off) => {
     const p0=np(k1),p1=cp(k1,k2),p2=np(k2);
@@ -1087,25 +1087,25 @@ function renderCanvas() {
 
   // Nodes
   const T = S.tank, P = S.pond;
-  drawNode('gw', 'GATEWAY', 'Node 0x01 — Master', '#b070ff', [
-    { text: 'Commands all nodes', color:'#7050a0' },
-    { text: S.gw.lastTankTel ? `Tank: water=${S.gw.lastTankTel.water}/3` : 'Awaiting telemetry...', color: '#9060d0' },
-    { text: S.gw.lastPondTel ? `Pond: pump ${S.gw.lastPondTel.pump?'ON':'off'}` : '', color: '#9060d0' },
+  drawNode('gw', 'GATEWAY', 'Node 0x01 — Master', '#7030c8', [
+    { text: 'Commands all nodes', color:'#8050b8' },
+    { text: S.gw.lastTankTel ? `Tank: water=${S.gw.lastTankTel.water}/3` : 'Awaiting telemetry...', color: '#9060c8' },
+    { text: S.gw.lastPondTel ? `Pond: pump ${S.gw.lastPondTel.pump?'ON':'off'}` : '', color: '#9060c8' },
   ]);
 
   const waterPct = T ? Math.round((T.waterLevel/3)*100) : 0;
-  const wColor = waterPct < 10 ? '#ff4030' : waterPct < 40 ? '#ffa030' : '#50aaff';
-  drawNode('tank', 'TANK CTRL', 'Node 0x02', '#50aaff', [
+  const wColor = waterPct < 10 ? '#c81818' : waterPct < 40 ? '#b05800' : '#1a72d0';
+  drawNode('tank', 'TANK CTRL', 'Node 0x02', '#1a72d0', [
     { text: T ? `Water: ${waterPct}%  [${T.waterDisc}/3]` : '', color: wColor, bold: true },
-    { text: T ? `Mode: ${T.autoMode?'AUTO':'MANUAL'}` : '', color: T&&T.autoMode?'#40e870':'#ffa030' },
+    { text: T ? `Mode: ${T.autoMode?'AUTO':'MANUAL'}` : '', color: T&&T.autoMode?'#18a040':'#b05800' },
     { text: T&&T.pondCmdPending ? '⏳ Cmd pending...' : `P1:${T&&T.p1?'●':'○'} P2:${T&&T.p2?'●':'○'} P3:${T&&T.p3?'●':'○'}`,
-      color: T&&T.pondCmdPending ? '#ffa030' : '#3a6080' },
+      color: T&&T.pondCmdPending ? '#b05800' : '#6080a0' },
   ]);
 
-  drawNode('pond', 'POND CTRL', 'Node 0x03', '#40d880', [
-    { text: P ? `Pump: ${P.pumpOn?'ON ◉':'off ○'}` : '', color: P&&P.pumpOn?'#40e870':'#2a6040', bold: true },
-    { text: 'Broadcasts telemetry', color:'#306840' },
-    { text: 'No ACK — tel confirms', color:'#306840' },
+  drawNode('pond', 'POND CTRL', 'Node 0x03', '#18a050', [
+    { text: P ? `Pump: ${P.pumpOn?'ON ◉':'off ○'}` : '', color: P&&P.pumpOn?'#18a040':'#6090a0', bold: true },
+    { text: 'Broadcasts telemetry', color:'#407868' },
+    { text: 'No ACK — tel confirms', color:'#407868' },
   ]);
 
   // Packets
@@ -1145,19 +1145,19 @@ function renderCanvas() {
     const remMs = busy ? Math.max(0, S.channel.freeAt - realNow) : 0;
     const barW  = 260, barH = 18, barX = canvas.width - barW - 8, barY = 8;
 
-    ctx.fillStyle = busy ? '#1a1000' : '#0a1a0a';
-    ctx.strokeStyle = busy ? '#604010' : '#1a4020';
+    ctx.fillStyle = busy ? '#fff4e0' : '#f0f8f0';
+    ctx.strokeStyle = busy ? '#c08030' : '#60b040';
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.roundRect(barX, barY, barW, barH, 3); ctx.fill(); ctx.stroke();
 
     // Fill progress
     if (busy) {
       const fill = (AIR_TIME_MS - remMs) / AIR_TIME_MS;
-      ctx.fillStyle = '#c06010';
+      ctx.fillStyle = '#f0a030';
       ctx.beginPath(); ctx.roundRect(barX+1, barY+1, (barW-2)*fill, barH-2, 2); ctx.fill();
     }
 
-    ctx.fillStyle = busy ? '#ffb040' : '#40c060';
+    ctx.fillStyle = busy ? '#904800' : '#207040';
     ctx.font = 'bold 10px Courier New';
     ctx.textAlign = 'center';
     const nodeLabel = { gw:'GW', tank:'TANK', pond:'POND' };
@@ -1169,7 +1169,7 @@ function renderCanvas() {
   }
 
   // ── Sim time display ──────────────────────────────────────────────────────
-  ctx.fillStyle = '#2a4060';
+  ctx.fillStyle = '#7090b0';
   ctx.font = '11px Courier New';
   ctx.textAlign = 'left';
   ctx.fillText(`sim-time: ${S.simTime.toFixed(1)}s  speed: ${S.speed}×  ${S.paused?'PAUSED':'running'}`, 10, canvas.height - 10);
