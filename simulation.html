@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 LoRa System — Full Simulator</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#07101e;color:#aacce0;font-size:13px;overflow-x:hidden}
+.hdr{background:#0c1930;border-bottom:2px solid #1b3968;padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.htitle{color:#6ab0ff;font-size:15px;font-weight:bold;letter-spacing:.5px}
+.hsub{color:#3a6080;font-size:11px;margin-top:2px}
+.cg{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.clbl{color:#3a6080;font-size:11px}
+.btn{background:#111e34;border:1px solid #253a68;color:#6a9cd0;padding:5px 11px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:12px;transition:background .15s}
+.btn:hover{background:#1a2e50}
+.btn.act{background:#154085;border-color:#3070c0;color:#c0dfff}
+#cv{display:block;width:100%;background:#050d1a;border-bottom:1px solid #162540;cursor:default}
+.pnls{display:flex;gap:8px;padding:8px;background:#050d1a}
+.pnl{flex:1;background:#0b1828;border:1px solid #1b2f50;border-radius:4px;padding:10px;min-width:0}
+.ptitle{font-size:13px;font-weight:bold;padding-bottom:7px;margin-bottom:7px;border-bottom:1px solid #1b2f50;display:flex;align-items:center;gap:7px}
+.pdot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
+.pgw .ptitle{color:#b070ff}.pgw .pdot{background:#b070ff;box-shadow:0 0 6px #b070ff}
+.ptank .ptitle{color:#50aaff}.ptank .pdot{background:#50aaff;box-shadow:0 0 6px #50aaff}
+.ppond .ptitle{color:#40d880}.ppond .pdot{background:#40d880;box-shadow:0 0 6px #40d880}
+.f{display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid #0c1828;font-size:12px}
+.fl{color:#3a6080}.fv{color:#90c0e0;font-weight:bold}
+.fon{color:#40e870!important}.foff{color:#203040!important}
+.fwarn{color:#ffa030!important}.ferr{color:#ff4030!important}
+.fpend{color:#ffa030!important;animation:blk .7s infinite}
+@keyframes blk{0%,100%{opacity:1}50%{opacity:.2}}
+.wtank{border:2px solid #1a5090;border-radius:4px 4px 6px 6px;height:68px;position:relative;overflow:hidden;background:#050f1e;margin:7px 0 3px}
+.wbody{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,#0048b8,#0070d8 50%,#1890f0);transition:height .4s linear}
+.wmarks{position:absolute;top:0;bottom:0;right:5px;display:flex;flex-direction:column;justify-content:space-around;font-size:9px;color:#285070;z-index:1;pointer-events:none}
+.wdashes{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;justify-content:space-around;z-index:1;pointer-events:none}
+.wd{border-top:1px dashed #0e2840;margin:0 2px}
+.wlbl{font-size:10px;color:#3a6080;text-align:center;margin-bottom:5px}
+.pr{display:flex;gap:5px;margin:5px 0;flex-wrap:wrap}
+.pi{display:flex;align-items:center;gap:4px;background:#0a1520;border:1px solid #1a2a40;border-radius:3px;padding:4px 8px;font-size:11px}
+.pled{width:8px;height:8px;border-radius:50%;background:#182438}
+.pled.on{background:#38e060;box-shadow:0 0 7px #38e060}
+.pled.pw{background:#ffa030;animation:blk .7s infinite}
+.cmdsec{margin-top:8px;padding-top:8px;border-top:1px solid #1b2f50}
+.ctitle{font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}
+.bcmd{background:#0b1e38;border:1px solid #1e3a68;color:#6090c8;padding:5px 9px;cursor:pointer;border-radius:3px;font-family:inherit;font-size:11px;margin:3px 0;display:block;width:100%;text-align:left;transition:background .15s}
+.bcmd:hover{background:#142840}
+.bcmd.pon{border-color:#1e6035;color:#40c870}.bcmd.pon:hover{background:#0e2818}
+.bcmd.poff{border-color:#602010;color:#c85040}.bcmd.poff:hover{background:#280808}
+.logsec{padding:8px;background:#050d1a;border-top:1px solid #162540}
+.logtitle{font-size:12px;color:#5090d0;padding-bottom:6px;border-bottom:1px solid #1b2f50;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+#log{height:180px;overflow-y:auto;background:#040810;border:1px solid #162540;border-radius:3px;padding:6px;font-size:11px;line-height:1.7}
+.le{margin:0;white-space:pre-wrap;word-break:break-all}
+.lt{color:#253848}.lgw{color:#9050f0}.ltk{color:#4090e0}.lpd{color:#38b870}.lwn{color:#e09030}.lsy{color:#304860}
+.protosec{padding:8px;background:#050d1a;border-top:1px solid #162540;display:flex;gap:10px;flex-wrap:wrap}
+.pbox{flex:1;min-width:180px}
+.pbox h3{font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;padding-bottom:4px;margin-bottom:4px;border-bottom:1px solid #162540}
+.pitem{display:flex;align-items:center;gap:5px;font-size:11px;padding:2px 0;color:#7090b0}
+.pdl{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.pkv{font-size:11px;color:#4a6a90;padding:1px 0}
+.pkv b{color:#8ab0cc;font-weight:normal}
+@media(max-width:720px){.pnls{flex-direction:column}.protosec{flex-direction:column}}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="hdr">
+  <div>
+    <div class="htitle">ESP32 LoRa Network Simulator</div>
+    <div class="hsub">Gateway 0x01 &nbsp;·&nbsp; Tank Controller 0x02 &nbsp;·&nbsp; Pond Controller 0x03 &nbsp;·&nbsp; 868 MHz · SF9 · BW125 · CR4/5 · Sync 0x12</div>
+  </div>
+  <div class="cg">
+    <span class="clbl">SIM SPEED:</span>
+    <button class="btn" id="spd1"  onclick="setSpeed(1)">1×</button>
+    <button class="btn" id="spd5"  onclick="setSpeed(5)">5×</button>
+    <button class="btn act" id="spd10" onclick="setSpeed(10)">10×</button>
+    <button class="btn" id="spd30" onclick="setSpeed(30)">30×</button>
+    &nbsp;
+    <button class="btn" id="btnPause" onclick="togglePause()">⏸ Pause</button>
+    <button class="btn" onclick="resetSim()">↺ Reset</button>
+  </div>
+</div>
+
+<!-- CANVAS: network topology + animated packets -->
+<canvas id="cv" height="360"></canvas>
+
+<!-- THREE DEVICE PANELS -->
+<div class="pnls">
+
+  <!-- GATEWAY -->
+  <div class="pnl pgw">
+    <div class="ptitle"><span class="pdot"></span>GATEWAY CONTROLLER &nbsp;·&nbsp; Node 0x01</div>
+    <div class="f"><span class="fl">Role</span><span class="fv">Master — all commands obeyed</span></div>
+    <div class="f"><span class="fl">Last tank telemetry</span><span class="fv" id="gw-lt">—</span></div>
+    <div class="f"><span class="fl">Last pond telemetry</span><span class="fv" id="gw-lp">—</span></div>
+    <div class="f"><span class="fl">Tank water level</span><span class="fv" id="gw-wl">—</span></div>
+    <div class="f"><span class="fl">Tank mode</span><span class="fv" id="gw-mode">—</span></div>
+    <div class="f"><span class="fl">Pond pump</span><span class="fv" id="gw-pp">—</span></div>
+
+    <div class="cmdsec">
+      <div class="ctitle">Commands → Tank (0x02)</div>
+      <button class="bcmd" onclick="gwTankAuto(true)">→ Tank: Switch to AUTO mode</button>
+      <button class="bcmd" onclick="gwTankAuto(false)">→ Tank: Switch to MANUAL mode</button>
+      <button class="bcmd" onclick="gwTankP(1,true)">→ Tank: P1 ON &nbsp;(manual only)</button>
+      <button class="bcmd" onclick="gwTankP(1,false)">→ Tank: P1 OFF (manual only)</button>
+      <button class="bcmd" onclick="gwTankP(2,true)">→ Tank: P2 ON &nbsp;(manual only)</button>
+      <button class="bcmd" onclick="gwTankP(2,false)">→ Tank: P2 OFF (manual only)</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Commands → Pond (0x03)</div>
+      <button class="bcmd pon" onclick="gwPond(true)">→ Pond: Pump ON</button>
+      <button class="bcmd poff" onclick="gwPond(false)">→ Pond: Pump OFF</button>
+    </div>
+    <div class="cmdsec">
+      <div class="ctitle">Info Requests → Tank</div>
+      <button class="bcmd" onclick="gwConfigGet()">→ Tank: Request CONFIG (CONFIG_GET)</button>
+      <button class="bcmd" onclick="gwStatsGet()">→ Tank: Request STATS (STATS_GET)</button>
+    </div>
+  </div>
+
+  <!-- TANK -->
+  <div class="pnl ptank">
+    <div class="ptitle"><span class="pdot"></span>TANK CONTROLLER &nbsp;·&nbsp; Node 0x02</div>
+
+    <div class="wtank">
+      <div class="wbody" id="wbody" style="height:100%"></div>
+      <div class="wmarks"><span>L3</span><span>L2</span><span>L1</span><span>L0</span></div>
+      <div class="wdashes"><div class="wd"></div><div class="wd"></div><div class="wd"></div><div class="wd"></div></div>
+    </div>
+    <div class="wlbl" id="wlbl">Water: 3 / 3 — FULL</div>
+
+    <div class="f"><span class="fl">Mode</span><span class="fv" id="tk-mode">AUTO</span></div>
+    <div class="f"><span class="fl">Error code</span><span class="fv" id="tk-err">0 = OK</span></div>
+    <div class="f"><span class="fl">Gateway last seen</span><span class="fv" id="tk-gwc">0s ago</span></div>
+    <div class="f"><span class="fl">Pond last seen</span><span class="fv" id="tk-pdc">0s ago</span></div>
+
+    <div style="margin-top:6px;font-size:10px;color:#3a6080;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Local Pumps (P1/P2/P3)</div>
+    <div class="pr">
+      <div class="pi"><div class="pled" id="lp1"></div><span>P1</span></div>
+      <div class="pi"><div class="pled" id="lp2"></div><span>P2</span></div>
+      <div class="pi"><div class="pled" id="lp3"></div><span>P3</span></div>
+    </div>
+
+    <div class="f"><span class="fl">Pond pump (last known)</span><span class="fv" id="tk-ppk">—</span></div>
+    <div class="f"><span class="fl">pondCmdPending</span><span class="fv" id="tk-pcp">false</span></div>
+    <div class="f"><span class="fl">Cmd confirmation deadline</span><span class="fv" id="tk-dead">—</span></div>
+    <div class="f"><span class="fl">Fill cycles (auto)</span><span class="fv" id="tk-fc">0</span></div>
+    <div class="f"><span class="fl">Replenish runon</span><span class="fv" id="tk-ro">inactive</span></div>
+    <div class="f"><span class="fl">Next telemetry in</span><span class="fv" id="tk-tel">—</span></div>
+  </div>
+
+  <!-- POND -->
+  <div class="pnl ppond">
+    <div class="ptitle"><span class="pdot"></span>POND CONTROLLER &nbsp;·&nbsp; Node 0x03</div>
+
+    <div class="pr" style="margin-bottom:8px">
+      <div class="pi" style="flex:1;justify-content:center;padding:8px">
+        <div class="pled" id="lpond" style="width:12px;height:12px"></div>
+        <span style="font-size:14px;font-weight:bold" id="pond-lbl">PUMP OFF</span>
+      </div>
+    </div>
+
+    <div class="f"><span class="fl">Pump state</span><span class="fv" id="pd-pump">off</span></div>
+    <div class="f"><span class="fl">Last cmd received at</span><span class="fv" id="pd-lc">—</span></div>
+    <div class="f"><span class="fl">Last cmd source</span><span class="fv" id="pd-src">—</span></div>
+    <div class="f"><span class="fl">Next telemetry in</span><span class="fv" id="pd-tel">—</span></div>
+    <div class="f"><span class="fl">Telemetry target</span><span class="fv">BROADCAST (0xFF) → GW + Tank</span></div>
+
+    <div style="margin-top:10px;padding:8px;background:#081e10;border:1px solid #153020;border-radius:4px;font-size:11px;color:#50a868;line-height:1.7">
+      <div style="color:#306848;margin-bottom:3px;text-transform:uppercase;letter-spacing:1px;font-size:10px">Pond Behavior</div>
+      ↪ Receives pump ON/OFF from Tank or Gateway<br>
+      ↪ No ACK sent — confirms via next telemetry<br>
+      ↪ Broadcasts telemetry every 10 sim-s (both GW and Tank receive it)<br>
+      ↪ Also communicates directly with Gateway independently
+    </div>
+  </div>
+
+</div><!-- /panels -->
+
+<!-- EVENT LOG -->
+<div class="logsec">
+  <div class="logtitle">
+    <span>EVENT LOG — Real-time LoRa communication trace</span>
+    <button class="btn" style="font-size:10px;padding:3px 8px" onclick="document.getElementById('log').innerHTML=''">CLEAR</button>
+  </div>
+  <div id="log"></div>
+</div>
+
+<!-- PROTOCOL REFERENCE -->
+<div class="protosec">
+  <div class="pbox">
+    <h3>Packet Structure (38 bytes total)</h3>
+    <div class="pkv">Header (6 bytes):</div>
+    <div class="pkv">&nbsp;[0-1] <b>magic_word</b> — network ID (0xE22A)</div>
+    <div class="pkv">&nbsp;[2]   <b>source_id</b>  — sender node ID</div>
+    <div class="pkv">&nbsp;[3]   <b>target_id</b>  — destination node ID</div>
+    <div class="pkv">&nbsp;[4]   <b>msg_type</b>   — message type (1-8)</div>
+    <div class="pkv">&nbsp;[5]   <b>msg_id</b>    — rolling counter 0-255</div>
+    <div class="pkv" style="margin-top:4px">Payload (32 bytes, union by type)</div>
+  </div>
+  <div class="pbox">
+    <h3>Message Types</h3>
+    <div class="pitem"><div class="pdl" style="background:#40c0ff"></div>1 = TELEMETRY — periodic state broadcast</div>
+    <div class="pitem"><div class="pdl" style="background:#ffa040"></div>2 = COMMAND — pump ON/OFF, mode change</div>
+    <div class="pitem"><div class="pdl" style="background:#c060ff"></div>4 = CONFIG_GET — request config values</div>
+    <div class="pitem"><div class="pdl" style="background:#c060ff"></div>5 = CONFIG_SET — write config to flash</div>
+    <div class="pitem"><div class="pdl" style="background:#c060ff"></div>6 = CONFIG_RESP — config reply</div>
+    <div class="pitem"><div class="pdl" style="background:#60e0a0"></div>7 = STATS_GET — request runtime stats</div>
+    <div class="pitem"><div class="pdl" style="background:#60e0a0"></div>8 = STATS_RESP — stats reply</div>
+  </div>
+  <div class="pbox">
+    <h3>Node IDs</h3>
+    <div class="pitem"><div class="pdl" style="background:#b070ff"></div>0x01 = Gateway Controller</div>
+    <div class="pitem"><div class="pdl" style="background:#50aaff"></div>0x02 = Tank Controller (this device)</div>
+    <div class="pitem"><div class="pdl" style="background:#40d880"></div>0x03 = Pond Controller</div>
+    <div class="pitem"><div class="pdl" style="background:#888888"></div>0xFF = BROADCAST (all nodes receive)</div>
+    <h3 style="margin-top:8px">system_flags Bits (telemetry)</h3>
+    <div class="pkv"><b>bit 0</b> = auto_mode &nbsp;<b>bit 1</b> = P1 &nbsp;<b>bit 2</b> = P2</div>
+    <div class="pkv"><b>bit 3</b> = P3 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>bit 4</b> = pond pump</div>
+  </div>
+  <div class="pbox">
+    <h3>RF Settings (must match all devices)</h3>
+    <div class="pkv">Frequency: <b>868.0 MHz</b></div>
+    <div class="pkv">Bandwidth: <b>125 kHz</b></div>
+    <div class="pkv">Spreading factor: <b>SF9</b></div>
+    <div class="pkv">Coding rate: <b>CR 4/5</b></div>
+    <div class="pkv">Sync word: <b>0x12</b></div>
+    <div class="pkv">Preamble: <b>8 symbols</b></div>
+    <div class="pkv">Air time: <b>~415 ms / packet</b></div>
+    <div class="pkv">TCXO: <b>1.8 V (DIO3)</b></div>
+  </div>
+</div>
+
+<script>
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+const NODE_GW   = 0x01;
+const NODE_TANK = 0x02;
+const NODE_POND = 0x03;
+const NODE_BC   = 0xFF;
+
+const MSG_TELEMETRY  = 1;
+const MSG_COMMAND    = 2;
+const MSG_CONFIG_GET = 4;
+const MSG_CONFIG_SET = 5;
+const MSG_CONFIG_RSP = 6;
+const MSG_STATS_GET  = 7;
+const MSG_STATS_RSP  = 8;
+
+const MSG_NAME = {1:'TELEMETRY',2:'COMMAND',4:'CONFIG_GET',5:'CONFIG_SET',6:'CONFIG_RESP',7:'STATS_GET',8:'STATS_RESP'};
+const MSG_COLOR = {1:'#40c0ff',2:'#ffa040',4:'#c060ff',5:'#c060ff',6:'#c060ff',7:'60e0a0',8:'#60e0a0'};
+// Fix missing # on stats
+MSG_COLOR[7] = '#60e0a0';
+
+// Node canvas positions (normalized 0-1)
+const NP = { gw:{x:.50,y:.17}, tank:{x:.21,y:.82}, pond:{x:.79,y:.82} };
+
+// Bezier control points per link (normalized)
+const CTRL = {
+  'gw-tank':{x:.25,y:.52}, 'tank-gw':{x:.25,y:.52},
+  'gw-pond':{x:.75,y:.52}, 'pond-gw':{x:.75,y:.52},
+  'tank-pond':{x:.50,y:.94}, 'pond-tank':{x:.50,y:.94},
+};
+
+// Node box dimensions (px at reference width 800)
+const NW = 130, NH = 88;
+
+// =============================================================================
+// SIMULATION STATE
+// =============================================================================
+
+let S = {}; // simulation state — initialized by resetSim()
+
+function resetSim() {
+  S = {
+    simTime: 0,
+    speed: 10,
+    paused: false,
+    packets: [],
+    pkId: 0,
+
+    gw: {
+      lastTankTel: null,
+      lastPondTel: null,
+    },
+
+    tank: {
+      msgId: 0,
+      autoMode: true,
+      waterLevel: 3.0,    // 0.0 – 3.0 continuous
+      waterDisc: 3,       // integer 0-3 (float switches)
+
+      p1: false, p2: false, p3: false,
+
+      pondPumpKnown: false,  // last state reported by pond telemetry
+      pondCmdPending: false,
+      pondCmdExpected: false,
+      pondCmdDeadline: 0,
+
+      replenishActive: false,
+      replenishStart: 0,
+      replenishRunon: 30,       // sim-seconds (real: 300s)
+      cmdResponseTimeout: 15,   // sim-seconds
+
+      lastTelSent: -8,          // stagger: tank fires at 0, 10, 20...
+      telInterval: 10,
+
+      lastGwContact: 0,
+      lastPondContact: 0,
+      networkTimeout: 60,
+
+      errorCode: 0,
+      fillCycles: 0,
+    },
+
+    pond: {
+      msgId: 0,
+      pumpOn: false,
+      lastTelSent: -3,          // stagger: pond fires at 5, 15, 25...
+      telInterval: 10,
+      lastCmdAt: -1,
+      lastCmdSrc: '',
+    },
+  };
+
+  setSpeedUI(10);
+  addLog('sys', 'Simulation started. Tank starts FULL, AUTO mode enabled.');
+  addLog('sys', 'Tank will drain slowly. When empty it auto-requests pond pump ON.');
+  renderUI();
+}
+
+// =============================================================================
+// PACKET HELPERS
+// =============================================================================
+
+function spawnPkt(fromKey, toKey, msgType, desc) {
+  // toKey can be 'gw','tank','pond' or null (broadcast handled by caller)
+  S.packets.push({
+    id: S.pkId++,
+    fromKey, toKey, msgType, desc,
+    startReal: performance.now(),
+    durMs: 2000,  // 2 real-seconds of flight time
+    delivered: false,
+    alpha: 1,
+  });
+}
+
+function nodeKey(id) {
+  return id === NODE_GW ? 'gw' : id === NODE_TANK ? 'tank' : 'pond';
+}
+
+// =============================================================================
+// COMMUNICATION ACTIONS (called by simulation logic or button handlers)
+// =============================================================================
+
+function tankSendTelemetry() {
+  S.tank.msgId = (S.tank.msgId + 1) & 0xFF;
+  const t = S.tank;
+  const flags = (t.autoMode?1:0)|(t.p1?2:0)|(t.p2?4:0)|(t.p3?8:0)|(t.pondPumpKnown?16:0);
+  const desc = `TELEMETRY | water=${t.waterDisc}/3 | P1=${t.p1?'ON':'off'} P2=${t.p2?'ON':'off'} P3=${t.p3?'ON':'off'} | ${t.autoMode?'AUTO':'MANUAL'} | err=${t.errorCode} | flags=0x${flags.toString(16).padStart(2,'0')}`;
+  spawnPkt('tank','gw', MSG_TELEMETRY, desc);
+  addLog('tank',`TX TELEMETRY → Gateway | water=${t.waterDisc}/3 | ${t.autoMode?'AUTO':'MANUAL'} | err=${t.errorCode}`);
+}
+
+function pondSendTelemetry() {
+  S.pond.msgId = (S.pond.msgId + 1) & 0xFF;
+  const desc = `TELEMETRY | pondPump=${S.pond.pumpOn?'ON':'off'}`;
+  // Pond broadcasts: spawn one packet to GW and one to Tank
+  spawnPkt('pond','gw',   MSG_TELEMETRY, desc);
+  spawnPkt('pond','tank', MSG_TELEMETRY, desc);
+  addLog('pond',`TX TELEMETRY [BROADCAST→0xFF] | pondPump=${S.pond.pumpOn?'ON':'off'} | both GW and Tank receive`);
+}
+
+function tankCmdPond(wantOn) {
+  S.tank.pondCmdPending  = true;
+  S.tank.pondCmdExpected = wantOn;
+  S.tank.pondCmdDeadline = S.simTime + S.tank.cmdResponseTimeout;
+  const desc = `COMMAND | target_pump=pond | action=${wantOn?'ON':'OFF'}`;
+  spawnPkt('tank','pond', MSG_COMMAND, desc);
+  addLog('tank',`TX COMMAND → Pond | pondPump → ${wantOn?'ON':'OFF'} | deadline in ${S.tank.cmdResponseTimeout}s`);
+}
+
+// =============================================================================
+// PACKET DELIVERY — what happens when a packet arrives at its destination
+// =============================================================================
+
+function deliverPacket(pkt) {
+  const now = S.simTime;
+
+  // ---------- TANK receives ----------
+  if (pkt.toKey === 'tank') {
+    if (pkt.msgType === MSG_TELEMETRY && pkt.fromKey === 'pond') {
+      S.tank.lastPondContact = now;
+      S.tank.pondPumpKnown   = S.pond.pumpOn;
+
+      if (S.tank.pondCmdPending) {
+        if (S.pond.pumpOn === S.tank.pondCmdExpected) {
+          S.tank.pondCmdPending = false;
+          addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'} ✓ CONFIRMED (command acknowledged via telemetry)`);
+        } else {
+          addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'} ✗ mismatch — still waiting...`);
+        }
+      } else {
+        addLog('tank',`RX TELEMETRY from Pond | pondPump=${S.pond.pumpOn?'ON':'off'}`);
+      }
+    }
+    else if (pkt.msgType === MSG_COMMAND && pkt.fromKey === 'gw') {
+      // Gateway commands are ALWAYS obeyed — no auto-mode check
+      S.tank.lastGwContact = now;
+      if (pkt.desc.includes('AUTO')) {
+        S.tank.autoMode = true;
+        addLog('tank',`RX COMMAND from Gateway | → AUTO mode [gateway is master — always obeyed]`);
+      } else if (pkt.desc.includes('MANUAL')) {
+        S.tank.autoMode = false;
+        addLog('tank',`RX COMMAND from Gateway | → MANUAL mode [gateway is master — always obeyed]`);
+      } else if (pkt.desc.includes('P1:ON'))  { S.tank.p1 = true;  addLog('tank','RX COMMAND from Gateway | P1 → ON'); }
+      else if (pkt.desc.includes('P1:OFF')) { S.tank.p1 = false; addLog('tank','RX COMMAND from Gateway | P1 → OFF'); }
+      else if (pkt.desc.includes('P2:ON'))  { S.tank.p2 = true;  addLog('tank','RX COMMAND from Gateway | P2 → ON'); }
+      else if (pkt.desc.includes('P2:OFF')) { S.tank.p2 = false; addLog('tank','RX COMMAND from Gateway | P2 → OFF'); }
+    }
+    else if (pkt.msgType === MSG_CONFIG_GET && pkt.fromKey === 'gw') {
+      S.tank.lastGwContact = now;
+      addLog('tank',`RX CONFIG_GET from Gateway | sending CONFIG_RESP`);
+      spawnPkt('tank','gw', MSG_CONFIG_RSP,
+        `CONFIG_RESP | tel_interval=10s | net_timeout=60s | cmd_resp_timeout=15s | boot_auto=1`);
+    }
+    else if (pkt.msgType === MSG_STATS_GET && pkt.fromKey === 'gw') {
+      S.tank.lastGwContact = now;
+      addLog('tank',`RX STATS_GET from Gateway | sending STATS_RESP`);
+      spawnPkt('tank','gw', MSG_STATS_RSP,
+        `STATS_RESP | fill_cycles=${S.tank.fillCycles} | uptime=${Math.floor(now)}s`);
+    }
+  }
+
+  // ---------- GATEWAY receives ----------
+  if (pkt.toKey === 'gw') {
+    if (pkt.msgType === MSG_TELEMETRY && pkt.fromKey === 'tank') {
+      S.gw.lastTankTel = { at: now, water: S.tank.waterDisc, auto: S.tank.autoMode, p1:S.tank.p1, p2:S.tank.p2, p3:S.tank.p3 };
+      addLog('gw',`RX TELEMETRY from Tank | water=${S.tank.waterDisc}/3 | ${S.tank.autoMode?'AUTO':'MANUAL'}`);
+    }
+    else if (pkt.msgType === MSG_TELEMETRY && pkt.fromKey === 'pond') {
+      S.gw.lastPondTel = { at: now, pump: S.pond.pumpOn };
+      addLog('gw',`RX TELEMETRY from Pond [broadcast] | pondPump=${S.pond.pumpOn?'ON':'off'}`);
+    }
+    else if (pkt.msgType === MSG_CONFIG_RSP) {
+      addLog('gw',`RX CONFIG_RESP from Tank | ${pkt.desc.replace('CONFIG_RESP | ','')}`);
+    }
+    else if (pkt.msgType === MSG_STATS_RSP) {
+      addLog('gw',`RX STATS_RESP from Tank | ${pkt.desc.replace('STATS_RESP | ','')}`);
+    }
+  }
+
+  // ---------- POND receives ----------
+  if (pkt.toKey === 'pond' && pkt.msgType === MSG_COMMAND) {
+    const wantOn = pkt.desc.includes('ON');
+    S.pond.pumpOn    = wantOn;
+    S.pond.lastCmdAt = S.simTime;
+    S.pond.lastCmdSrc = pkt.fromKey === 'gw' ? 'Gateway' : 'Tank';
+    addLog('pond',`RX COMMAND from ${S.pond.lastCmdSrc} | pondPump → ${wantOn?'ON':'off'} | will confirm in next telemetry broadcast`);
+  }
+}
+
+// =============================================================================
+// MAIN SIMULATION UPDATE — called every animation frame
+// =============================================================================
+
+let lastRealTime = null;
+
+function update(realNow) {
+  if (S.paused) { lastRealTime = realNow; return; }
+
+  const realDt = lastRealTime === null ? 0 : Math.min(realNow - lastRealTime, 100);
+  lastRealTime = realNow;
+
+  const dt = (realDt * S.speed) / 1000; // simulated seconds this frame
+  S.simTime += dt;
+  const now = S.simTime;
+  const T = S.tank;
+  const P = S.pond;
+
+  // ── Water physics ──────────────────────────────────────────────────────────
+  // Drain rate: empties from full (3) in 1500 sim-sec = 25 sim-minutes
+  // Fill rate:  fills from empty in ~375 sim-sec when pond pump running
+  const DRAIN = 0.002;
+  const FILL  = 0.010;
+  T.waterLevel = Math.max(0, Math.min(3, T.waterLevel - DRAIN * dt + (P.pumpOn ? FILL * dt : 0)));
+  T.waterDisc  = Math.min(3, Math.max(0, Math.round(T.waterLevel)));
+
+  // ── Local pumps in AUTO mode ───────────────────────────────────────────────
+  // P1 circulates when there's water (level ≥ 1)
+  // P2/P3 assist circulation at higher levels
+  if (T.autoMode) {
+    T.p1 = T.waterDisc >= 1;
+    T.p2 = T.waterDisc >= 2;
+    T.p3 = T.waterDisc >= 3;
+  }
+
+  // ── pondCmdPending timeout ─────────────────────────────────────────────────
+  // If pond doesn't confirm within cmdResponseTimeout, we give up and log it.
+  if (T.pondCmdPending && now >= T.pondCmdDeadline) {
+    T.pondCmdPending = false;
+    addLog('warn',`WARN: Pond telemetry confirmation not received within ${T.cmdResponseTimeout}s — pondCmdPending cleared`);
+  }
+
+  // ── AUTO MODE CONTROL ENGINE ───────────────────────────────────────────────
+  if (T.autoMode) {
+    // Water empty → ask pond to start pumping
+    if (T.waterLevel < 0.15 && !P.pumpOn && !T.pondCmdPending) {
+      T.fillCycles++;
+      tankCmdPond(true);
+      addLog('tank',`AUTO: Water level critical (${T.waterLevel.toFixed(2)}) → requesting pond pump ON (fill cycle #${T.fillCycles})`);
+    }
+
+    // Water full → start or check replenish runon timer
+    if (T.waterLevel > 2.85 && P.pumpOn && !T.pondCmdPending) {
+      if (!T.replenishActive) {
+        T.replenishActive = true;
+        T.replenishStart  = now;
+        addLog('tank',`AUTO: Tank full — starting replenish runon (${T.replenishRunon}s)`);
+      } else if (now - T.replenishStart >= T.replenishRunon) {
+        T.replenishActive = false;
+        tankCmdPond(false);
+        addLog('tank',`AUTO: Replenish runon complete → requesting pond pump OFF`);
+      }
+    } else if (T.waterLevel < 2.80) {
+      // Water not full anymore — reset runon timer
+      if (T.replenishActive) {
+        T.replenishActive = false;
+        addLog('tank',`AUTO: Water dropped below full — replenish runon reset`);
+      }
+    }
+  }
+
+  // ── Telemetry scheduling ───────────────────────────────────────────────────
+  if (now - T.lastTelSent >= T.telInterval) {
+    T.lastTelSent = now;
+    tankSendTelemetry();
+  }
+  if (now - P.lastTelSent >= P.telInterval) {
+    P.lastTelSent = now;
+    pondSendTelemetry();
+  }
+
+  // ── Network timeout check ──────────────────────────────────────────────────
+  T.errorCode = (now - T.lastGwContact > T.networkTimeout) ? 3 : 0;
+
+  // ── Advance packets ────────────────────────────────────────────────────────
+  const realNowMs = performance.now();
+  for (const pkt of S.packets) {
+    pkt.progress = Math.min(1, (realNowMs - pkt.startReal) / pkt.durMs);
+    if (pkt.progress >= 1 && !pkt.delivered) {
+      pkt.delivered = true;
+      deliverPacket(pkt);
+    }
+  }
+  // Remove packets that have fully faded (1.5s after delivery)
+  S.packets = S.packets.filter(p => (realNowMs - p.startReal) < p.durMs + 1500);
+}
+
+// =============================================================================
+// GATEWAY BUTTON HANDLERS
+// =============================================================================
+
+function gwTankAuto(on) {
+  const desc = `COMMAND | target=TANK | ${on ? 'AUTO' : 'MANUAL'}`;
+  spawnPkt('gw','tank', MSG_COMMAND, desc);
+  addLog('gw',`TX COMMAND → Tank | mode → ${on?'AUTO':'MANUAL'} [gateway is master]`);
+}
+
+function gwTankP(n, on) {
+  const desc = `COMMAND | target=TANK | P${n}:${on?'ON':'OFF'}`;
+  spawnPkt('gw','tank', MSG_COMMAND, desc);
+  addLog('gw',`TX COMMAND → Tank | P${n} → ${on?'ON':'OFF'}`);
+}
+
+function gwPond(on) {
+  const desc = `COMMAND | target_pump=pond | action=${on?'ON':'OFF'}`;
+  spawnPkt('gw','pond', MSG_COMMAND, desc);
+  addLog('gw',`TX COMMAND → Pond | pondPump → ${on?'ON':'OFF'} [gateway is master]`);
+}
+
+function gwConfigGet() {
+  spawnPkt('gw','tank', MSG_CONFIG_GET, 'CONFIG_GET');
+  addLog('gw','TX CONFIG_GET → Tank');
+}
+
+function gwStatsGet() {
+  spawnPkt('gw','tank', MSG_STATS_GET, 'STATS_GET');
+  addLog('gw','TX STATS_GET → Tank');
+}
+
+// =============================================================================
+// SPEED / PAUSE CONTROLS
+// =============================================================================
+
+function setSpeed(s) {
+  S.speed = s;
+  setSpeedUI(s);
+}
+
+function setSpeedUI(s) {
+  [1,5,10,30].forEach(n => {
+    const el = document.getElementById('spd'+n);
+    if (el) el.className = 'btn' + (n === s ? ' act' : '');
+  });
+}
+
+function togglePause() {
+  S.paused = !S.paused;
+  document.getElementById('btnPause').textContent = S.paused ? '▶ Resume' : '⏸ Pause';
+  if (!S.paused) lastRealTime = null;
+}
+
+// =============================================================================
+// EVENT LOG
+// =============================================================================
+
+function addLog(type, msg) {
+  const t = S.simTime.toFixed(1);
+  const logEl = document.getElementById('log');
+  const cls = {tank:'ltk', pond:'lpd', gw:'lgw', warn:'lwn', sys:'lsy'}[type] || 'lsy';
+  const srcLabel = {tank:'[TANK]', pond:'[POND]', gw:'[GW  ]', warn:'[WARN]', sys:'[SYS ]'}[type] || '[???]';
+  const p = document.createElement('p');
+  p.className = 'le';
+  p.innerHTML = `<span class="lt">${t.padStart(8,'0')}s </span><span class="${cls}">${srcLabel} ${escHtml(msg)}</span>`;
+  logEl.appendChild(p);
+  // Keep max 200 entries
+  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// =============================================================================
+// UI PANEL UPDATE
+// =============================================================================
+
+function fmtAgo(simNow, lastTime) {
+  if (lastTime <= 0) return 'never';
+  const s = Math.floor(simNow - lastTime);
+  if (s < 60) return `${s}s ago`;
+  return `${Math.floor(s/60)}m ${s%60}s ago`;
+}
+
+function setTxt(id, txt) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = txt;
+}
+
+function setCls(id, cls) {
+  const el = document.getElementById(id);
+  if (el) el.className = 'fv ' + cls;
+}
+
+function renderUI() {
+  const T = S.tank, P = S.pond, G = S.gw, now = S.simTime;
+
+  // Water visual
+  const pct = (T.waterLevel / 3) * 100;
+  const wb = document.getElementById('wbody');
+  if (wb) wb.style.height = pct.toFixed(1) + '%';
+  const status = T.waterLevel < 0.2 ? 'CRITICAL — EMPTY' :
+                 T.waterLevel > 2.85 ? 'FULL' : `${T.waterDisc}/3 (${Math.round(pct)}%)`;
+  setTxt('wlbl', `Water: ${status}`);
+
+  // Tank panel
+  setTxt('tk-mode', T.autoMode ? 'AUTO' : 'MANUAL');
+  setCls('tk-mode', T.autoMode ? 'fv fon' : 'fv fwarn');
+
+  if (T.errorCode === 0) { setTxt('tk-err','0 = OK'); setCls('tk-err','fv fon'); }
+  else { setTxt('tk-err','3 = NO-COMMS (gateway not seen)'); setCls('tk-err','fv ferr'); }
+
+  setTxt('tk-gwc', fmtAgo(now, T.lastGwContact));
+  setTxt('tk-pdc', fmtAgo(now, T.lastPondContact));
+
+  setPled('lp1', T.p1);
+  setPled('lp2', T.p2);
+  setPled('lp3', T.p3);
+
+  setTxt('tk-ppk', T.pondPumpKnown ? 'ON' : 'off');
+  setCls('tk-ppk', T.pondPumpKnown ? 'fv fon' : 'fv foff');
+
+  if (T.pondCmdPending) {
+    const rem = Math.max(0, T.pondCmdDeadline - now).toFixed(1);
+    setTxt('tk-pcp', `true — waiting for pond telemetry (${rem}s left)`);
+    setCls('tk-pcp','fv fpend');
+    setTxt('tk-dead', `${T.pondCmdDeadline.toFixed(0)}s (expecting pump ${T.pondCmdExpected?'ON':'OFF'})`);
+  } else {
+    setTxt('tk-pcp','false');
+    setCls('tk-pcp','fv foff');
+    setTxt('tk-dead','—');
+  }
+
+  setTxt('tk-fc', String(T.fillCycles));
+
+  if (T.replenishActive) {
+    const elapsed = (now - T.replenishStart).toFixed(1);
+    setTxt('tk-ro', `${elapsed}s / ${T.replenishRunon}s`);
+    setCls('tk-ro','fv fwarn');
+  } else {
+    setTxt('tk-ro','inactive');
+    setCls('tk-ro','fv foff');
+  }
+
+  const nextTel = Math.max(0, T.lastTelSent + T.telInterval - now).toFixed(1);
+  setTxt('tk-tel', nextTel + 's');
+
+  // Pond panel
+  const pumpOn = P.pumpOn;
+  setPled('lpond', pumpOn, true);
+  setTxt('pond-lbl', pumpOn ? 'PUMP ON' : 'PUMP OFF');
+  setTxt('pd-pump', pumpOn ? 'ON' : 'off');
+  setCls('pd-pump', pumpOn ? 'fv fon' : 'fv foff');
+  setTxt('pd-lc', P.lastCmdAt >= 0 ? `${P.lastCmdAt.toFixed(1)}s` : '—');
+  setTxt('pd-src', P.lastCmdSrc || '—');
+  const nextPdTel = Math.max(0, P.lastTelSent + P.telInterval - now).toFixed(1);
+  setTxt('pd-tel', nextPdTel + 's');
+
+  // Gateway panel
+  if (G.lastTankTel) {
+    setTxt('gw-lt', `${G.lastTankTel.at.toFixed(1)}s ago`);
+    setTxt('gw-wl', `${G.lastTankTel.water}/3`);
+    setTxt('gw-mode', G.lastTankTel.auto ? 'AUTO' : 'MANUAL');
+  } else {
+    setTxt('gw-lt','—'); setTxt('gw-wl','—'); setTxt('gw-mode','—');
+  }
+  if (G.lastPondTel) {
+    setTxt('gw-lp', `${G.lastPondTel.at.toFixed(1)}s ago`);
+    setTxt('gw-pp', G.lastPondTel.pump ? 'ON' : 'off');
+  } else {
+    setTxt('gw-lp','—'); setTxt('gw-pp','—');
+  }
+}
+
+function setPled(id, on, large) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'pled' + (on ? ' on' : '');
+  if (large) { el.style.width = '12px'; el.style.height = '12px'; }
+}
+
+// =============================================================================
+// CANVAS RENDERING
+// =============================================================================
+
+const canvas = document.getElementById('cv');
+const ctx    = canvas.getContext('2d');
+
+function resizeCanvas() {
+  canvas.width  = canvas.clientWidth;
+  canvas.height = 360;
+}
+
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function np(key) { // normalized → canvas pixels
+  return { x: NP[key].x * canvas.width, y: NP[key].y * canvas.height };
+}
+
+function cp(key1, key2) { // control point → canvas pixels
+  const k = `${key1}-${key2}`;
+  const c = CTRL[k] || {x:.5,y:.5};
+  return { x: c.x * canvas.width, y: c.y * canvas.height };
+}
+
+function bezier(t, p0, p1, p2) {
+  const mt = 1 - t;
+  return { x: mt*mt*p0.x + 2*mt*t*p1.x + t*t*p2.x,
+           y: mt*mt*p0.y + 2*mt*t*p1.y + t*t*p2.y };
+}
+
+function drawLink(k1, k2, color, alpha, dashed) {
+  const p0 = np(k1), p1 = cp(k1,k2), p2 = np(k2);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  if (dashed) ctx.setLineDash([6,5]);
+  ctx.beginPath();
+  ctx.moveTo(p0.x, p0.y);
+  ctx.quadraticCurveTo(p1.x, p1.y, p2.x, p2.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawNode(key, label, subLabel, color, extraLines) {
+  const p = np(key);
+  const W = Math.min(NW, canvas.width * 0.22);
+  const H = NH;
+  const x = p.x - W/2, y = p.y - H/2;
+  const r = 8;
+
+  // Shadow / glow
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = 16;
+  ctx.fillStyle   = '#0c1828';
+  ctx.beginPath();
+  ctx.roundRect(x, y, W, H, r);
+  ctx.fill();
+  ctx.restore();
+
+  // Border
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  ctx.beginPath();
+  ctx.roundRect(x, y, W, H, r);
+  ctx.stroke();
+
+  // Title bar
+  ctx.fillStyle = color + '28';
+  ctx.beginPath();
+  ctx.roundRect(x, y, W, 22, [r,r,0,0]);
+  ctx.fill();
+
+  // Texts
+  ctx.fillStyle = color;
+  ctx.font = 'bold 11px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, p.x, y + 14);
+
+  ctx.fillStyle = '#5080a0';
+  ctx.font = '10px Courier New';
+  ctx.fillText(subLabel, p.x, y + 30);
+
+  // Extra info lines
+  const lineH = 13;
+  extraLines.forEach((line, i) => {
+    ctx.fillStyle = line.color || '#7090b0';
+    ctx.font = line.bold ? 'bold 11px Courier New' : '11px Courier New';
+    ctx.fillText(line.text, p.x, y + 44 + i * lineH);
+  });
+
+  ctx.textAlign = 'left';
+}
+
+function drawPacket(pkt) {
+  if (!pkt.toKey) return;
+  const p0 = np(pkt.fromKey), p1 = cp(pkt.fromKey, pkt.toKey), p2 = np(pkt.toKey);
+  const pos = bezier(pkt.progress, p0, p1, p2);
+
+  // Fade out after delivery
+  const age = performance.now() - pkt.startReal;
+  const alpha = pkt.delivered ? Math.max(0, 1 - (age - pkt.durMs) / 1500) : 1;
+
+  const color = MSG_COLOR[pkt.msgType] || '#ffffff';
+  const r = 7;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // Glow
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = 12;
+  ctx.fillStyle   = color;
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
+  ctx.fill();
+
+  // Inner dot
+  ctx.shadowBlur = 0;
+  ctx.fillStyle  = '#ffffff';
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, 2.5, 0, Math.PI*2);
+  ctx.fill();
+
+  // Label
+  ctx.font = '9px Courier New';
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.fillText(MSG_NAME[pkt.msgType] || '?', pos.x, pos.y - 11);
+
+  ctx.restore();
+}
+
+function renderCanvas() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background grid
+  ctx.fillStyle = '#050d1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = '#0a1628';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < canvas.width; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y < canvas.height; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+  }
+
+  // Determine if pondCmdPending (makes the tank-pond link glow orange)
+  const pending = S.tank && S.tank.pondCmdPending;
+
+  // Links
+  drawLink('gw','tank',   '#1a3060', 0.8, false);
+  drawLink('tank','gw',   '#1a3060', 0.8, false);
+  drawLink('gw','pond',   '#1a3060', 0.8, false);
+  drawLink('pond','gw',   '#1a3060', 0.8, false);
+  drawLink('tank','pond', pending ? '#ffa030' : '#1a3060', pending ? 0.7 : 0.8, pending);
+  drawLink('pond','tank', pending ? '#ffa030' : '#1a3060', pending ? 0.7 : 0.8, pending);
+
+  // Link labels
+  ctx.font = '9px Courier New';
+  ctx.fillStyle = '#2a4060';
+  ctx.textAlign = 'center';
+  const labPos = (k1,k2,off) => {
+    const p0=np(k1),p1=cp(k1,k2),p2=np(k2);
+    const m=bezier(.5,p0,p1,p2);
+    return {x:m.x+off.x, y:m.y+off.y};
+  };
+  let lp;
+  lp = labPos('gw','tank',{x:-22,y:0}); ctx.fillText('LoRa 868 MHz',lp.x,lp.y);
+  lp = labPos('gw','pond',{x:22,y:0});  ctx.fillText('LoRa 868 MHz',lp.x,lp.y);
+  lp = labPos('tank','pond',{x:0,y:14});ctx.fillText('LoRa 868 MHz',lp.x,lp.y);
+
+  // Nodes
+  const T = S.tank, P = S.pond;
+  drawNode('gw', 'GATEWAY', 'Node 0x01 — Master', '#b070ff', [
+    { text: 'Commands all nodes', color:'#7050a0' },
+    { text: S.gw.lastTankTel ? `Tank: water=${S.gw.lastTankTel.water}/3` : 'Awaiting telemetry...', color: '#9060d0' },
+    { text: S.gw.lastPondTel ? `Pond: pump ${S.gw.lastPondTel.pump?'ON':'off'}` : '', color: '#9060d0' },
+  ]);
+
+  const waterPct = T ? Math.round((T.waterLevel/3)*100) : 0;
+  const wColor = waterPct < 10 ? '#ff4030' : waterPct < 40 ? '#ffa030' : '#50aaff';
+  drawNode('tank', 'TANK CTRL', 'Node 0x02', '#50aaff', [
+    { text: T ? `Water: ${waterPct}%  [${T.waterDisc}/3]` : '', color: wColor, bold: true },
+    { text: T ? `Mode: ${T.autoMode?'AUTO':'MANUAL'}` : '', color: T&&T.autoMode?'#40e870':'#ffa030' },
+    { text: T&&T.pondCmdPending ? '⏳ Cmd pending...' : `P1:${T&&T.p1?'●':'○'} P2:${T&&T.p2?'●':'○'} P3:${T&&T.p3?'●':'○'}`,
+      color: T&&T.pondCmdPending ? '#ffa030' : '#3a6080' },
+  ]);
+
+  drawNode('pond', 'POND CTRL', 'Node 0x03', '#40d880', [
+    { text: P ? `Pump: ${P.pumpOn?'ON ◉':'off ○'}` : '', color: P&&P.pumpOn?'#40e870':'#2a6040', bold: true },
+    { text: 'Broadcasts telemetry', color:'#306840' },
+    { text: 'No ACK — tel confirms', color:'#306840' },
+  ]);
+
+  // Packets
+  for (const pkt of S.packets) drawPacket(pkt);
+
+  // Sim time display
+  ctx.fillStyle = '#2a4060';
+  ctx.font = '11px Courier New';
+  ctx.textAlign = 'left';
+  ctx.fillText(`sim-time: ${S.simTime.toFixed(1)}s  speed: ${S.speed}×  ${S.paused?'PAUSED':'running'}`, 10, canvas.height - 10);
+  ctx.textAlign = 'left';
+}
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+
+function loop(realNow) {
+  update(realNow);
+  renderCanvas();
+  renderUI();
+  requestAnimationFrame(loop);
+}
+
+// =============================================================================
+// BOOT
+// =============================================================================
+
+resetSim();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

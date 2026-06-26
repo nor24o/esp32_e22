@@ -88,10 +88,12 @@ void setup() {
     Serial.printf("[BOOT] Runtime  : P1=%lus  P2=%lus  P3=%lus  Pond=%lus\n",
                   gStats.runtime_p1_s, gStats.runtime_p2_s,
                   gStats.runtime_p3_s, gStats.runtime_pond_s);
-    Serial.printf("[BOOT] Config   : min_run=%lus  cooldown=%lus  replenish=%lus\n",
+    Serial.printf("[BOOT] Config   : min_run=%lus  cooldown=%lus  replenish=%lus  telemetry=%lus  cmd_timeout=%lus\n",
                   gConfig.pump_min_runtime_ms / 1000,
                   gConfig.pump_min_cooldown_ms / 1000,
-                  gConfig.replenish_runon_ms / 1000);
+                  gConfig.replenish_runon_ms / 1000,
+                  gConfig.telemetry_interval_ms / 1000,
+                  gConfig.cmd_response_timeout_ms / 1000);
     Serial.println("------------------------------------------------------------");
 
     // ── GPIO ─────────────────────────────────────────────────────────────────
