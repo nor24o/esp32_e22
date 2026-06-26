@@ -226,7 +226,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="card">
     <h2>Controls</h2>
 
-    <div class="section-label">Pump Commands <span style="font-weight:400;text-transform:none;letter-spacing:0">(gateway 0x01 · force-override)</span></div>
+    <div class="section-label">Pump Commands <span style="font-weight:400;text-transform:none;letter-spacing:0">(gateway 0x01 · always obeyed)</span></div>
     <div class="btn-grid">
       <button class="btn on"  onclick="sendCmd('pump','p=1&a=1')">P1 ON</button>
       <button class="btn off" onclick="sendCmd('pump','p=1&a=0')">P1 OFF</button>
@@ -246,7 +246,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="section-label" style="margin-top:14px">Pond Node Simulation <span style="font-weight:400;text-transform:none;letter-spacing:0">(pond 0x03)</span></div>
     <div class="pond-state">Pond pump: <span id="pondPumpState">OFF</span></div>
     <button class="btn act" onclick="sendCmd('telemetry','')" style="width:100%">Send Telemetry Now</button>
-    <div style="margin-top:6px;font-size:11px;color:var(--tx2)">Auto-ACKs pump cmds from tank &bull; keepalive every 30s &bull; telemetry every 25s</div>
+    <div style="margin-top:6px;font-size:11px;color:var(--tx2)">Records pump cmds from tank &bull; reports state in next telemetry &bull; keepalive every 30s &bull; telemetry every 10s</div>
   </div>
 
   <!-- ── Config ── -->
@@ -355,7 +355,7 @@ function handleMsg(d) {
       document.getElementById('cfgChip').className     = 'chip ok';
       document.getElementById('cfgSetBtn').disabled    = false;
       document.getElementById('cfgStatus').textContent = '';
-      addLog('rx', `CONFIG_RESP  pmr=${d.pmr/1000}s pmc=${d.pmc/1000}s pro=${d.pro/1000}s ti=${d.ti/1000}s nt=${d.nt/1000}s at=${d.at/1000}s amr=${d.amr} bam=${d.bam}  rssi=${d.rssi}`);
+      addLog('rx', `CONFIG_RESP  pmr=${d.pmr/1000}s pmc=${d.pmc/1000}s pro=${d.pro/1000}s ti=${d.ti/1000}s nt=${d.nt/1000}s crt=${d.crt/1000}s bam=${d.bam}  rssi=${d.rssi}`);
       break;
     }
 
@@ -377,14 +377,11 @@ function handleMsg(d) {
       break;
     }
 
-    case 'ack':
-      addLog('rx', `ACK  acked_id=${d.id}  rssi=${d.rssi}  snr=${d.snr}`);
-      break;
-
     case 'cmd':
       addLog('rx', `COMMAND  pump=${d.pump}  action=${d.action ? 'ON' : 'OFF'}  id=${d.id}  rssi=${d.rssi}`);
-      if (currentRole === 'pond') {
-        document.getElementById('pondPumpState').textContent = (d.pump === 1 && d.action) ? 'ON' : 'OFF';
+      // If the command is to the pond pump, update the displayed pond state.
+      if (d.pump === 1) {
+        document.getElementById('pondPumpState').textContent = d.action ? 'ON' : 'OFF';
       }
       break;
 
@@ -465,17 +462,16 @@ function sendCmd(cmd, params) {
 // ── Config editor ─────────────────────────────────────────────────────────
 
 // Raw ms/unit values — mirrors DEF_* in config.hpp
-const CFG_DEFAULTS = { pmr:30000, pmc:60000, pro:300000, ti:30000, nt:60000, at:10000, amr:5, bam:1 };
+const CFG_DEFAULTS = { pmr:30000, pmc:60000, pro:300000, ti:10000, nt:60000, crt:15000, bam:1 };
 
 const CFG_FIELDS = [
-  { key:'pmr', label:'Pump min runtime',   ms:true,  min:5,   max:3600,  def:30  },
-  { key:'pmc', label:'Pump min cooldown',  ms:true,  min:5,   max:3600,  def:60  },
-  { key:'pro', label:'Replenish run-on',   ms:true,  min:30,  max:86400, def:300 },
-  { key:'ti',  label:'Telemetry interval', ms:true,  min:5,   max:3600,  def:30  },
-  { key:'nt',  label:'Network timeout',    ms:true,  min:10,  max:3600,  def:60  },
-  { key:'at',  label:'ACK timeout',        ms:true,  min:1,   max:60,    def:10  },
-  { key:'amr', label:'ACK max retries',    ms:false, min:1,   max:10,    def:5   },
-  { key:'bam', label:'Boot auto mode',     bool:true,                    def:1   },
+  { key:'pmr', label:'Pump min runtime',        ms:true, min:5,   max:3600,  def:30  },
+  { key:'pmc', label:'Pump min cooldown',       ms:true, min:5,   max:3600,  def:60  },
+  { key:'pro', label:'Replenish run-on',        ms:true, min:30,  max:86400, def:300 },
+  { key:'ti',  label:'Telemetry interval',      ms:true, min:5,   max:3600,  def:10  },
+  { key:'nt',  label:'Network timeout',         ms:true, min:10,  max:3600,  def:60  },
+  { key:'crt', label:'Cmd response timeout',    ms:true, min:5,   max:120,   def:15  },
+  { key:'bam', label:'Boot auto mode',          bool:true,                   def:1   },
 ];
 
 function buildCfgForm(d) {
@@ -529,8 +525,7 @@ function sendCfgSet() {
     [msg.pro, 30000,  86400000,  'replenish_runon (30–86400 s)'],
     [msg.ti,  5000,   3600000,   'telemetry_interval (5–3600 s)'],
     [msg.nt,  10000,  3600000,   'network_timeout (10–3600 s)'],
-    [msg.at,  1000,   60000,     'ack_timeout (1–60 s)'],
-    [msg.amr, 1,      10,        'ack_max_retries (1–10)'],
+    [msg.crt, 5000,   120000,    'cmd_response_timeout (5–120 s)'],
   ];
   for (const [v, lo, hi, name] of checks) {
     if (!Number.isFinite(v) || v < lo || v > hi) { addLog('err', name + ' out of range'); return; }
