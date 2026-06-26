@@ -1,13 +1,23 @@
 #pragma once
 
 // =============================================================================
-// PIN DEFINITIONS
+// TANK CONTROLLER — HARDWARE PIN DEFINITIONS AND DEFAULT CONFIG VALUES
+//
+// This file describes:
+//   1. Which GPIO pins connect to which hardware on the tank controller board.
+//   2. The default values for the runtime configuration (NodeConfig).
+//
+// RF settings (frequency, bandwidth, etc.) live in protocol.hpp because they
+// are shared by all devices.  Only the TX power is here because it depends on
+// the specific radio module used (tank uses a higher-power SX1262).
 // =============================================================================
 
-#define LORA_NSS   5
+// ── LoRa module (SX1262 E22) pin connections ─────────────────────────────────
+// Conditional compilation: ESP32-S3 uses different SPI pin numbers than classic ESP32.
+#define LORA_NSS   5   // SPI chip-select (active low)
 #ifdef CONFIG_IDF_TARGET_ESP32S3
-  #define LORA_DIO1  16
-  #define LORA_BUSY  17
+  #define LORA_DIO1  16  // Interrupt line from SX1262 (TX done, RX done)
+  #define LORA_BUSY  17  // Busy pin — wait for LOW before sending a command to SX1262
   #define LORA_MOSI  11
   #define LORA_MISO  13
 #else
@@ -16,116 +26,74 @@
   #define LORA_MOSI  23
   #define LORA_MISO  19
 #endif
-#define LORA_NRST  14
-#define LORA_SCK   18
+#define LORA_NRST  14   // Hardware reset pin for SX1262
+#define LORA_SCK   18   // SPI clock
 
-#define WS2812B_PIN  48
-#define NUM_LEDS     10
+// Tank uses 22 dBm; the test TTGO board uses 14 dBm (its SX1276 maximum).
+#define LORA_TX_POWER    22
 
-// I2C bus for PCF8574 I/O expander
-//   P0–P2 : vertical float switches (mechanical reed, active-low — closed = LOW)
-//   P3–P7 : TTP223 capacitive touch modules
-// All 8 pins are written 0xFF (inputs with internal quasi-bidirectional pull-ups).
+// ── WS2812B LED strip ─────────────────────────────────────────────────────────
+#define WS2812B_PIN  48   // Data pin for the LED strip
+#define NUM_LEDS     10   // Number of LEDs in the strip
+
+// ── I2C bus for PCF8574 I/O expander ─────────────────────────────────────────
+// The PCF8574 gives us 8 extra digital I/O pins over I2C.
+//   P0–P2 : float switches (water level sensors, active-low: LOW when water is present)
+//   P3–P7 : TTP223 capacitive touch buttons
 #define I2C_SDA  1
 #define I2C_SCL  2
+#define PCF8574_ADDR  0x27   // I2C address of the expander chip
 
-// PCF8574 I/O expander — address and pin assignments
-#define PCF8574_ADDR  0x27
+// PCF8574 bit positions for float switches (water level sensors)
+#define PCF_FLOAT_0   0  // Lowest float switch  → water level ≥ 1
+#define PCF_FLOAT_1   1  // Middle float switch  → water level ≥ 2
+#define PCF_FLOAT_2   2  // Upper float switch   → water level = 3 (full)
 
-// Float switch inputs (P0–P2): switch closed (water present) pulls pin LOW
-#define PCF_FLOAT_0   0  // lowest float switch  (level ≥ 1)
-#define PCF_FLOAT_1   1  // middle float switch   (level ≥ 2)
-#define PCF_FLOAT_2   2  // upper float switch    (level = 3 / full)
+// TTP223 touch button wiring note:
+//   Default (A-pad open, B-pad open): idle = LOW, touched = HIGH
+//   Set TTP223_TOUCHED_LEVEL to 0 if you bridge the A-pad (inverts polarity).
+#define TTP223_TOUCHED_LEVEL  1   // 1 = active-HIGH (default TTP223 wiring)
 
-// TTP223 capacitive touch module inputs (P3–P7)
-// TTP223 default wiring (A-pad open, B-pad open):
-//   idle (not touched) → output LOW  → PCF pin LOW
-//   touched            → output HIGH → PCF pin HIGH
-// We detect the rising edge (LOW→HIGH) as a touch event.
-// If your TTP223 modules have the A-pad bridged (active-LOW mode) flip
-// TTP223_TOUCHED_LEVEL to 0 and update the edge detection in task_input_sensor.hpp.
-#define TTP223_TOUCHED_LEVEL  1   // 1 = active-HIGH (default), 0 = active-LOW (A-pad bridged)
+// PCF8574 bit positions for touch buttons
+#define PCF_TOUCH_MODE  3  // Toggle between AUTO and MANUAL mode
+#define PCF_TOUCH_P1    4  // Toggle pump P1 (manual mode only)
+#define PCF_TOUCH_P2    5  // Toggle pump P2 (manual mode only)
+#define PCF_TOUCH_P3    6  // Toggle pump P3 (manual mode only)
+#define PCF_TOUCH_POND  7  // Toggle pond pump (manual mode only)
 
-#define PCF_TOUCH_MODE  3  // MODE toggle button
-#define PCF_TOUCH_P1    4  // Pump 1 manual toggle
-#define PCF_TOUCH_P2    5  // Pump 2 manual toggle
-#define PCF_TOUCH_P3    6  // Pump 3 manual toggle
-#define PCF_TOUCH_POND  7  // Pond pump manual toggle
-
-// Legacy aliases — kept so existing code compiles without renaming every reference
+// Aliases so older code that uses PCF_BTN_xxx still compiles
 #define PCF_BTN_MODE  PCF_TOUCH_MODE
 #define PCF_BTN_P1    PCF_TOUCH_P1
 #define PCF_BTN_P2    PCF_TOUCH_P2
 #define PCF_BTN_P3    PCF_TOUCH_P3
 #define PCF_BTN_POND  PCF_TOUCH_POND
 
-// Relay and buzzer outputs (native GPIO, active-low: LOW=ON, HIGH=OFF)
+// ── Relay outputs ─────────────────────────────────────────────────────────────
+// Relays are active-low: writing LOW to the GPIO energises the relay (pump ON).
 #define RELAY_P1    47
 #define RELAY_P2    41
 #define RELAY_P3    39
-#define BUZZER_PIN  21
+#define BUZZER_PIN  21   // Also active-low
 
-#define CURRENT_P1_ADC  4   // ADC1_CH3 on S3 / ADC2_CH0 on ESP32
-// GPIO 39 is not ADC-capable on ESP32-S3; ADC1 is GPIO 1-10, ADC2 is GPIO 11-20
-#ifdef CONFIG_IDF_TARGET_ESP32S3
-  #define CURRENT_P2_ADC   7  // ADC1_CH6 on S3
-#else
-  #define CURRENT_P2_ADC  39  // ADC1_CH3 on classic ESP32 (input-only, safe)
-#endif
-#ifdef CONFIG_IDF_TARGET_ESP32S3
-  #define CURRENT_P3_ADC  3  // ADC1_CH2 on S3 (GPIO 2 reserved for I2C_SCL)
-#else
-  #define CURRENT_P3_ADC  2  // ADC2_CH2 on classic ESP32
-#endif
+// ── LED flash durations ───────────────────────────────────────────────────────
+#define FLASH_RX_MS  200UL   // LED stays lit for 200 ms on packet receive
+#define FLASH_TX_MS  200UL   // LED stays lit for 200 ms on packet transmit
 
-// =============================================================================
-// COMPILE-TIME CONSTANTS AND DEFAULTS
-// Items marked DEF_* seed NVS on first boot; after that gConfig is authoritative.
-// =============================================================================
-
-// LoRa RF  (fixed – not runtime-configurable)
-#define LORA_FREQUENCY   868.0f
-#define LORA_BANDWIDTH   125.0f
-#define LORA_SF          9
-#define LORA_CR          5
-#define LORA_SYNC_WORD   0x12
-#define LORA_TX_POWER    22
-#define LORA_PREAMBLE    8
-
-// Network identifiers
-#define MY_NETWORK_MAGIC  0x5A6B
-#define NODE_GATEWAY      0x01
-#define NODE_TANK_LOCAL   0x02
-#define NODE_POND_REMOTE  0x03
-#define NODE_BROADCAST    0xFF
-
-// Fixed operational constants (not user-tunable)
-#define ADC_SAMPLES           8
-#define FLASH_RX_MS           200UL
-#define FLASH_TX_MS           200UL
-#define FLASH_NET_MS          400UL
-
-// NVS
+// ── NVS (Non-Volatile Storage) keys ──────────────────────────────────────────
+// These keys identify the config and stats data stored in flash memory.
 #define NVS_NAMESPACE    "tanknode"
 #define NVS_CFG_VER_KEY  "cfgver"
 #define NVS_CFG_KEY      "cfg"
-#define CONFIG_VERSION   2  // bumped: overcurrent_grace_ticks + fault_lockout_enabled added
+// Bumping CONFIG_VERSION causes the device to ignore the old stored config and
+// reset to the defaults below.  Do this whenever NodeConfig changes shape.
+#define CONFIG_VERSION   5
 
-// Consecutive abnormal-reset counter stored in NVS.
-// If radio init crashes (INT_WDT/Panic) repeatedly we skip init to break the loop.
-#define NVS_RADIO_STREAK_KEY  "radio_cs"
-#define RADIO_SKIP_STREAK     3   // skip radio after this many consecutive crash-boots during init
-
-// Defaults for NodeConfig (applied on first boot or after version mismatch)
-#define DEF_PUMP_MIN_RUNTIME_MS        30000UL
-#define DEF_PUMP_MIN_COOLDOWN_MS       60000UL
-#define DEF_REPLENISH_RUNON_MS        300000UL
-#define DEF_TELEMETRY_INTERVAL_MS      30000UL
-#define DEF_NETWORK_TIMEOUT_MS         60000UL
-#define DEF_ACK_TIMEOUT_MS            10000UL  // LoRa round-trip at 868/SF9 + margin
-#define DEF_ACK_MAX_RETRIES                5
-#define DEF_OVERCURRENT_THRESH          3200
-#define DEF_DRYRUN_THRESH                150
-#define DEF_BOOT_AUTO_MODE                 1
-#define DEF_OVERCURRENT_GRACE_TICKS        5   // 5 × 50 ms = 250 ms inrush window
-#define DEF_FAULT_LOCKOUT_ENABLED          1   // 1=kill relays on fault  0=warn only
+// ── NodeConfig factory defaults ───────────────────────────────────────────────
+// Applied on first boot or when CONFIG_VERSION changes.
+#define DEF_PUMP_MIN_RUNTIME_MS        30000UL  // Pump runs at least 30 s before it can stop
+#define DEF_PUMP_MIN_COOLDOWN_MS       60000UL  // Wait 60 s after stop before restarting
+#define DEF_REPLENISH_RUNON_MS        300000UL  // Pond pump runs 5 min per tank refill
+#define DEF_TELEMETRY_INTERVAL_MS      10000UL  // Send telemetry every 10 s
+#define DEF_NETWORK_TIMEOUT_MS         60000UL  // Raise error if no peer message for 60 s
+#define DEF_CMD_RESPONSE_TIMEOUT_MS    15000UL  // Wait 15 s for pond telemetry after a command
+#define DEF_BOOT_AUTO_MODE                  1   // Start in auto mode after reboot

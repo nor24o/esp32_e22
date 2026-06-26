@@ -3,19 +3,40 @@
 #include "globals.hpp"
 
 // =============================================================================
-// TASK: UI ANIMATION  (Priority 1, Core 0, 30 ms)
+// TASK: UI ANIMATION  (Priority 1, Core 1, runs every 30 ms)
+//
+// Drives the WS2812B LED strip.  Each LED shows a specific piece of system status.
+//
+// LED layout (10 LEDs total):
+//
+//   LEDs 0–3  Water level bar
+//             0 = empty → all dim red
+//             1 = one float switch active → first LED cyan-green
+//             2 = two switches → two LEDs lit
+//             3 = full → three LEDs cyan-green, LED 3 bright blue
+//
+//   LED 4     Radio / system status
+//             Purple   → just received a packet
+//             Cyan     → just transmitted a packet
+//             Red      → no-comms error (lost contact with a peer)
+//             Yellow   → waiting for pond telemetry to confirm a command
+//             Green    → auto mode, all OK
+//             Blue     → manual mode, all OK
+//
+//   LED 5     Operating mode
+//             Green → auto mode
+//             Blue  → manual mode
+//
+//   LEDs 6–8  Local relay states (P1, P2, P3)
+//             Green → pump ON,  dim red → pump OFF
+//
+//   LED 9     Pond pump state
+//             Cyan     → pond pump running
+//             Dim blue → pond pump idle
+//             Dim orange → radio not available (no LoRa)
 // =============================================================================
 
 static void Task_UIAnimation(void *pvParams) {
-    // slow ~1.9 s cycle (256 steps × 30 ms / 4)
-    uint8_t  pulsePhase   = 0;
-    // fast ~384 ms cycle (256 / 20 × 30 ms) — fault strobe, ACK pulse
-    uint8_t  fastPhase    = 0;
-    // water shimmer wave ~700 ms cycle (256 / 11 × 30 ms)
-    uint8_t  shimmerPhase = 0;
-    // pump breathing ~640 ms cycle (256 / 12 × 30 ms)
-    uint8_t  pumpPhase    = 0;
-
     uint32_t lastRxFlash_ms = 0;
     uint32_t lastTxFlash_ms = 0;
 
@@ -26,22 +47,24 @@ static void Task_UIAnimation(void *pvParams) {
 
         uint32_t now = millis();
 
+        // Snapshot shared state.
         uint8_t  waterLevel, errorCode;
-        bool     autoMode, faultLockout, awaitingAck;
+        bool     autoMode, pondCmdPending;
         bool     relay_p1, relay_p2, relay_p3, pondPump;
         bool     rxFlash, txFlash;
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) != pdTRUE) continue;
 
-        waterLevel   = gState.waterLevel;
-        autoMode     = gState.autoMode;
-        faultLockout = gState.faultLockout;
-        awaitingAck  = gState.awaitingAck;
-        errorCode    = gState.errorCode;
-        relay_p1     = gState.relay_p1;
-        relay_p2     = gState.relay_p2;
-        relay_p3     = gState.relay_p3;
-        pondPump     = gState.pondPump;
+        waterLevel     = gState.waterLevel;
+        autoMode       = gState.autoMode;
+        pondCmdPending = gState.pondCmdPending;
+        errorCode      = gState.errorCode;
+        relay_p1       = gState.relay_p1;
+        relay_p2       = gState.relay_p2;
+        relay_p3       = gState.relay_p3;
+        pondPump       = gState.pondPump;
+
+        // Read flash flags and immediately clear them so each flash only shows once.
         rxFlash = gState.rxFlash; gState.rxFlash = false;
         txFlash = gState.txFlash; gState.txFlash = false;
 
@@ -50,103 +73,52 @@ static void Task_UIAnimation(void *pvParams) {
         if (rxFlash) lastRxFlash_ms = now;
         if (txFlash) lastTxFlash_ms = now;
 
-        pulsePhase   += 4;
-        fastPhase    += 20;
-        shimmerPhase += 11;
-        pumpPhase    += 12;
-
+        // Start with all LEDs off.
         fill_solid(leds, NUM_LEDS, CRGB::Black);
 
-        // --- LEDs 0-3: water level bar (3 float switches → 4 LEDs) ---
-        // level 0 = empty (all 4 pulse dim red)
-        // level 1 = low   (LED 0 lit, LED 1 surface ripple, 2-3 dark hint)
-        // level 2 = mid   (LEDs 0-1 lit, LED 2 surface ripple, LED 3 dark hint)
-        // level 3 = full  (LEDs 0-2 lit, LED 3 bright pulsing full-indicator)
+        // ── LEDs 0–3: water level bar ─────────────────────────────────────────
         if (waterLevel == 0) {
-            uint8_t bri = scale8(sin8(pulsePhase), 50);
-            for (uint8_t i = 0; i < 4; i++) leds[i] = CRGB(bri, 0, 0);
+            // Tank completely empty — alert with dim red on all four LEDs.
+            for (uint8_t i = 0; i < 4; i++) leds[i] = CRGB(40, 0, 0);
         } else {
             for (uint8_t i = 0; i < 4; i++) {
-                if (i < waterLevel) {
-                    // lit water body — sine shimmer wave across LEDs
-                    uint8_t s = 150 + scale8(sin8(shimmerPhase + i * 64), 70);
-                    leds[i] = CRGB(0, s, s >> 1);
-                } else if (i == waterLevel) {
-                    // surface LED — faint ripple one step above fill line
-                    uint8_t surf = scale8(sin8((uint8_t)(shimmerPhase * 2 + 128)), 25);
-                    leds[i] = CRGB(0, surf, surf);
-                } else {
-                    leds[i] = CRGB(0, 0, 6);  // empty upper zone: dark blue hint
-                }
+                if (i < waterLevel)       leds[i] = CRGB(0, 160, 80);   // water present
+                else if (i == waterLevel) leds[i] = CRGB(0, 15,  8);    // surface marker
+                else                      leds[i] = CRGB(0, 0,   6);    // empty above
             }
-            if (waterLevel >= 3) {
-                // tank full: LED 3 pulses bright aqua as a "full" indicator
-                uint8_t bri = 180 + scale8(sin8((uint8_t)(pulsePhase * 3)), 75);
-                leds[3] = CRGB(0, bri >> 1, bri);
-            }
+            if (waterLevel >= 3) leds[3] = CRGB(0, 80, 200);            // full: bright blue
         }
 
-        // --- LED 4: system status ---
-        if (faultLockout || errorCode == 1 || errorCode == 2) {
-            // hard fault: fast red strobe
-            leds[4] = (fastPhase < 128) ? CRGB(255, 0, 0) : CRGB(25, 0, 0);
-
-        } else if (errorCode == 3) {
-            // comms error: slow red breathing
-            uint8_t bri = scale8(sin8(pulsePhase), 200) + 20;
-            leds[4] = CRGB(bri, 0, 0);
-
+        // ── LED 4: radio / system status ─────────────────────────────────────
+        if (errorCode == 3) {
+            leds[4] = CRGB(200, 0, 0);           // no-comms error: solid red
         } else if ((now - lastRxFlash_ms) < FLASH_RX_MS) {
-            leds[4] = CRGB(148, 0, 211);   // purple RX flash
-
+            leds[4] = CRGB(148, 0, 211);         // receiving: purple
         } else if ((now - lastTxFlash_ms) < FLASH_TX_MS) {
-            leds[4] = CRGB(0, 220, 220);   // cyan TX flash
-
-        } else if (awaitingAck) {
-            // fast yellow triangle pulse
-            leds[4] = CRGB(triwave8(fastPhase), triwave8(fastPhase), 0);
-
+            leds[4] = CRGB(0, 220, 220);         // transmitting: cyan
+        } else if (pondCmdPending) {
+            leds[4] = CRGB(180, 180, 0);         // waiting for pond confirmation: yellow
         } else if (autoMode) {
-            // auto OK: slow breathing green
-            uint8_t bri = scale8(sin8(pulsePhase), 180) + 40;
-            leds[4] = CRGB(0, bri, 0);
-
+            leds[4] = CRGB(0, 180, 0);           // auto mode, all good: green
         } else {
-            leds[4] = CRGB(0, 0, 160);     // manual: steady blue
+            leds[4] = CRGB(0, 0, 160);           // manual mode: blue
         }
 
-        // --- LED 5: mode indicator ---
-        if (autoMode) {
-            uint8_t bri = scale8(sin8((uint8_t)(pulsePhase + 128)), 100) + 80;
-            leds[5] = CRGB(0, bri, 0);     // breathing green
-        } else {
-            leds[5] = CRGB(0, 0, 120);     // steady blue
-        }
+        // ── LED 5: operating mode ─────────────────────────────────────────────
+        leds[5] = autoMode ? CRGB(0, 120, 0) : CRGB(0, 0, 120);
 
-        // --- LEDs 6-8: local relay states ---
-        // running: breathing green (each pump offset 120° so they pulse independently)
-        // off: dim dark red
-        const bool relays[3] = { relay_p1, relay_p2, relay_p3 };
-        for (uint8_t i = 0; i < 3; i++) {
-            if (relays[i]) {
-                uint8_t bri = scale8(sin8((uint8_t)(pumpPhase + i * 85)), 150) + 80;
-                leds[6 + i] = CRGB(0, bri, 0);
-            } else {
-                leds[6 + i] = CRGB(25, 0, 0);
-            }
-        }
+        // ── LEDs 6–8: local pump relays ───────────────────────────────────────
+        leds[6] = relay_p1 ? CRGB(0, 180, 0) : CRGB(25, 0, 0);
+        leds[7] = relay_p2 ? CRGB(0, 180, 0) : CRGB(25, 0, 0);
+        leds[8] = relay_p3 ? CRGB(0, 180, 0) : CRGB(25, 0, 0);
 
-        // --- LED 9: remote pond pump ---
+        // ── LED 9: pond pump state ────────────────────────────────────────────
         if (!gRadioOk) {
-            // no radio: dim orange slow pulse
-            uint8_t bri = scale8(sin8(pulsePhase), 30) + 15;
-            leds[9] = CRGB(bri, bri >> 2, 0);
+            leds[9] = CRGB(30, 8, 0);     // no radio: dim orange
         } else if (pondPump) {
-            // running: breathing cyan (phase offset from local pumps)
-            uint8_t bri = scale8(sin8((uint8_t)(pumpPhase + 170)), 160) + 60;
-            leds[9] = CRGB(0, bri, bri);
+            leds[9] = CRGB(0, 160, 160);  // pond pump running: cyan
         } else {
-            leds[9] = CRGB(0, 0, 30);      // idle + radio OK: dim blue
+            leds[9] = CRGB(0, 0, 30);     // pond pump idle: dim blue
         }
 
         FastLED.show();
