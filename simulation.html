@@ -250,9 +250,11 @@ const MSG_STATS_GET  = 7;
 const MSG_STATS_RSP  = 8;
 
 const MSG_NAME = {1:'TELEMETRY',2:'COMMAND',4:'CONFIG_GET',5:'CONFIG_SET',6:'CONFIG_RESP',7:'STATS_GET',8:'STATS_RESP'};
-const MSG_COLOR = {1:'#40c0ff',2:'#ffa040',4:'#c060ff',5:'#c060ff',6:'#c060ff',7:'60e0a0',8:'#60e0a0'};
-// Fix missing # on stats
-MSG_COLOR[7] = '#60e0a0';
+const MSG_COLOR = {1:'#40c0ff',2:'#ffa040',4:'#c060ff',5:'#c060ff',6:'#c060ff',7:'#60e0a0',8:'#60e0a0'};
+
+// LoRa SF9, BW125 kHz, CR4/5 → ~415 ms air time per 38-byte packet.
+// We use 900 ms real-time so the packet animation is clearly visible.
+const AIR_TIME_MS = 900;
 
 // Node canvas positions (normalized 0-1)
 const NP = { gw:{x:.50,y:.17}, tank:{x:.21,y:.82}, pond:{x:.79,y:.82} };
@@ -280,6 +282,17 @@ function resetSim() {
     paused: false,
     packets: [],
     pkId: 0,
+
+    // ── Shared LoRa channel (868 MHz, half-duplex) ─────────────────────────
+    // Only ONE device can transmit at a time. If a second device tries to TX
+    // while the channel is busy, its packet is queued and sent as soon as the
+    // channel clears. This mirrors real LoRa behaviour: simultaneous TX from
+    // two nodes causes a collision and both packets are lost.
+    channel: {
+      freeAt: 0,        // performance.now() when channel becomes free
+      busyNode: null,   // 'gw' | 'tank' | 'pond' | null
+    },
+    txQueue: [],        // pending { fromKey, toKey, msgType, desc, isBroadcast }
 
     gw: {
       lastTankTel: null,
@@ -328,6 +341,7 @@ function resetSim() {
   setSpeedUI(10);
   addLog('sys', 'Simulation started. Tank starts FULL, AUTO mode enabled.');
   addLog('sys', 'Tank will drain slowly. When empty it auto-requests pond pump ON.');
+  addLog('sys', 'Channel arbitration: only one node transmits at a time — others queue.');
   renderUI();
 }
 
@@ -335,20 +349,64 @@ function resetSim() {
 // PACKET HELPERS
 // =============================================================================
 
+// Low-level packet spawn — called only from startTransmit(). Do NOT call directly
+// from communication logic; use tryTransmit() instead so the channel is checked.
 function spawnPkt(fromKey, toKey, msgType, desc) {
-  // toKey can be 'gw','tank','pond' or null (broadcast handled by caller)
   S.packets.push({
     id: S.pkId++,
     fromKey, toKey, msgType, desc,
     startReal: performance.now(),
-    durMs: 2000,  // 2 real-seconds of flight time
+    durMs: AIR_TIME_MS,
     delivered: false,
-    alpha: 1,
   });
 }
 
 function nodeKey(id) {
   return id === NODE_GW ? 'gw' : id === NODE_TANK ? 'tank' : 'pond';
+}
+
+// =============================================================================
+// CHANNEL ARBITRATION — half-duplex shared 868 MHz medium
+// =============================================================================
+
+// Physically start a transmission: occupy the channel and spawn the packet(s).
+// For broadcasts (pond → 0xFF) one transmission reaches GW and Tank simultaneously.
+function startTransmit(fromKey, toKey, msgType, desc, isBroadcast) {
+  const realNow = performance.now();
+  S.channel.freeAt   = realNow + AIR_TIME_MS;
+  S.channel.busyNode = fromKey;
+
+  if (isBroadcast) {
+    // One over-the-air transmission; every other node receives it.
+    const targets = ['gw', 'tank', 'pond'].filter(k => k !== fromKey);
+    for (const tk of targets) spawnPkt(fromKey, tk, msgType, desc);
+  } else {
+    spawnPkt(fromKey, toKey, msgType, desc);
+  }
+}
+
+// Request a transmission. If the channel is free, transmit immediately.
+// If busy, put the request in the queue — it will fire once the channel clears.
+function tryTransmit(fromKey, toKey, msgType, desc, isBroadcast = false) {
+  const realNow = performance.now();
+  if (realNow >= S.channel.freeAt) {
+    startTransmit(fromKey, toKey, msgType, desc, isBroadcast);
+  } else {
+    const waitSec = ((S.channel.freeAt - realNow) / 1000).toFixed(2);
+    S.txQueue.push({ fromKey, toKey, msgType, desc, isBroadcast });
+    addLog('warn', `${fromKey.toUpperCase()} channel busy (${waitSec}s) — [${MSG_NAME[msgType]}] queued (queue depth: ${S.txQueue.length})`);
+  }
+}
+
+// Called every frame: if the channel just became free, transmit the next queued packet.
+function processTxQueue() {
+  if (S.txQueue.length === 0) return;
+  const realNow = performance.now();
+  if (realNow < S.channel.freeAt) return;
+
+  const next = S.txQueue.shift();
+  addLog('warn', `${next.fromKey.toUpperCase()} dequeuing [${MSG_NAME[next.msgType]}] — channel free now (${S.txQueue.length} still queued)`);
+  startTransmit(next.fromKey, next.toKey, next.msgType, next.desc, next.isBroadcast);
 }
 
 // =============================================================================
@@ -360,16 +418,16 @@ function tankSendTelemetry() {
   const t = S.tank;
   const flags = (t.autoMode?1:0)|(t.p1?2:0)|(t.p2?4:0)|(t.p3?8:0)|(t.pondPumpKnown?16:0);
   const desc = `TELEMETRY | water=${t.waterDisc}/3 | P1=${t.p1?'ON':'off'} P2=${t.p2?'ON':'off'} P3=${t.p3?'ON':'off'} | ${t.autoMode?'AUTO':'MANUAL'} | err=${t.errorCode} | flags=0x${flags.toString(16).padStart(2,'0')}`;
-  spawnPkt('tank','gw', MSG_TELEMETRY, desc);
+  tryTransmit('tank', 'gw', MSG_TELEMETRY, desc);
   addLog('tank',`TX TELEMETRY → Gateway | water=${t.waterDisc}/3 | ${t.autoMode?'AUTO':'MANUAL'} | err=${t.errorCode}`);
 }
 
 function pondSendTelemetry() {
   S.pond.msgId = (S.pond.msgId + 1) & 0xFF;
   const desc = `TELEMETRY | pondPump=${S.pond.pumpOn?'ON':'off'}`;
-  // Pond broadcasts: spawn one packet to GW and one to Tank
-  spawnPkt('pond','gw',   MSG_TELEMETRY, desc);
-  spawnPkt('pond','tank', MSG_TELEMETRY, desc);
+  // Single broadcast transmission on 0xFF — both GW and Tank receive it.
+  // The channel is occupied only once (one packet in the air).
+  tryTransmit('pond', null, MSG_TELEMETRY, desc, /*isBroadcast=*/true);
   addLog('pond',`TX TELEMETRY [BROADCAST→0xFF] | pondPump=${S.pond.pumpOn?'ON':'off'} | both GW and Tank receive`);
 }
 
@@ -378,7 +436,7 @@ function tankCmdPond(wantOn) {
   S.tank.pondCmdExpected = wantOn;
   S.tank.pondCmdDeadline = S.simTime + S.tank.cmdResponseTimeout;
   const desc = `COMMAND | target_pump=pond | action=${wantOn?'ON':'OFF'}`;
-  spawnPkt('tank','pond', MSG_COMMAND, desc);
+  tryTransmit('tank', 'pond', MSG_COMMAND, desc);
   addLog('tank',`TX COMMAND → Pond | pondPump → ${wantOn?'ON':'OFF'} | deadline in ${S.tank.cmdResponseTimeout}s`);
 }
 
@@ -423,13 +481,13 @@ function deliverPacket(pkt) {
     else if (pkt.msgType === MSG_CONFIG_GET && pkt.fromKey === 'gw') {
       S.tank.lastGwContact = now;
       addLog('tank',`RX CONFIG_GET from Gateway | sending CONFIG_RESP`);
-      spawnPkt('tank','gw', MSG_CONFIG_RSP,
+      tryTransmit('tank','gw', MSG_CONFIG_RSP,
         `CONFIG_RESP | tel_interval=10s | net_timeout=60s | cmd_resp_timeout=15s | boot_auto=1`);
     }
     else if (pkt.msgType === MSG_STATS_GET && pkt.fromKey === 'gw') {
       S.tank.lastGwContact = now;
       addLog('tank',`RX STATS_GET from Gateway | sending STATS_RESP`);
-      spawnPkt('tank','gw', MSG_STATS_RSP,
+      tryTransmit('tank','gw', MSG_STATS_RSP,
         `STATS_RESP | fill_cycles=${S.tank.fillCycles} | uptime=${Math.floor(now)}s`);
     }
   }
@@ -557,6 +615,10 @@ function update(realNow) {
   }
   // Remove packets that have fully faded (1.5s after delivery)
   S.packets = S.packets.filter(p => (realNowMs - p.startReal) < p.durMs + 1500);
+
+  // ── Channel arbitration ────────────────────────────────────────────────────
+  if (realNowMs >= S.channel.freeAt) S.channel.busyNode = null;
+  processTxQueue(); // send next queued packet if channel is now free
 }
 
 // =============================================================================
@@ -565,29 +627,29 @@ function update(realNow) {
 
 function gwTankAuto(on) {
   const desc = `COMMAND | target=TANK | ${on ? 'AUTO' : 'MANUAL'}`;
-  spawnPkt('gw','tank', MSG_COMMAND, desc);
+  tryTransmit('gw','tank', MSG_COMMAND, desc);
   addLog('gw',`TX COMMAND → Tank | mode → ${on?'AUTO':'MANUAL'} [gateway is master]`);
 }
 
 function gwTankP(n, on) {
   const desc = `COMMAND | target=TANK | P${n}:${on?'ON':'OFF'}`;
-  spawnPkt('gw','tank', MSG_COMMAND, desc);
+  tryTransmit('gw','tank', MSG_COMMAND, desc);
   addLog('gw',`TX COMMAND → Tank | P${n} → ${on?'ON':'OFF'}`);
 }
 
 function gwPond(on) {
   const desc = `COMMAND | target_pump=pond | action=${on?'ON':'OFF'}`;
-  spawnPkt('gw','pond', MSG_COMMAND, desc);
+  tryTransmit('gw','pond', MSG_COMMAND, desc);
   addLog('gw',`TX COMMAND → Pond | pondPump → ${on?'ON':'OFF'} [gateway is master]`);
 }
 
 function gwConfigGet() {
-  spawnPkt('gw','tank', MSG_CONFIG_GET, 'CONFIG_GET');
+  tryTransmit('gw','tank', MSG_CONFIG_GET, 'CONFIG_GET');
   addLog('gw','TX CONFIG_GET → Tank');
 }
 
 function gwStatsGet() {
-  spawnPkt('gw','tank', MSG_STATS_GET, 'STATS_GET');
+  tryTransmit('gw','tank', MSG_STATS_GET, 'STATS_GET');
   addLog('gw','TX STATS_GET → Tank');
 }
 
@@ -944,7 +1006,64 @@ function renderCanvas() {
   // Packets
   for (const pkt of S.packets) drawPacket(pkt);
 
-  // Sim time display
+  // ── TX ring around the transmitting node ──────────────────────────────────
+  const busyNode = S.channel && S.channel.busyNode;
+  if (busyNode) {
+    const p = np(busyNode);
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 120); // 0..1 pulsing
+    const ringR = 52 + pulse * 10;
+    const nodeColor = { gw:'#b070ff', tank:'#50aaff', pond:'#40d880' }[busyNode] || '#ffffff';
+    ctx.save();
+    ctx.globalAlpha = 0.25 + 0.25 * pulse;
+    ctx.strokeStyle = nodeColor;
+    ctx.lineWidth   = 2.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, ringR, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // "TX" badge
+    ctx.save();
+    ctx.fillStyle = nodeColor;
+    ctx.font = 'bold 10px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('📡 TX', p.x, p.y - ringR - 4);
+    ctx.restore();
+  }
+
+  // ── Channel status bar (top-right) ────────────────────────────────────────
+  {
+    const realNow = performance.now();
+    const qLen = S.txQueue ? S.txQueue.length : 0;
+    const busy  = S.channel && realNow < S.channel.freeAt;
+    const remMs = busy ? Math.max(0, S.channel.freeAt - realNow) : 0;
+    const barW  = 260, barH = 18, barX = canvas.width - barW - 8, barY = 8;
+
+    ctx.fillStyle = busy ? '#1a1000' : '#0a1a0a';
+    ctx.strokeStyle = busy ? '#604010' : '#1a4020';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(barX, barY, barW, barH, 3); ctx.fill(); ctx.stroke();
+
+    // Fill progress
+    if (busy) {
+      const fill = (AIR_TIME_MS - remMs) / AIR_TIME_MS;
+      ctx.fillStyle = '#c06010';
+      ctx.beginPath(); ctx.roundRect(barX+1, barY+1, (barW-2)*fill, barH-2, 2); ctx.fill();
+    }
+
+    ctx.fillStyle = busy ? '#ffb040' : '#40c060';
+    ctx.font = 'bold 10px Courier New';
+    ctx.textAlign = 'center';
+    const nodeLabel = { gw:'GW', tank:'TANK', pond:'POND' };
+    const label = busy
+      ? `📡 CHANNEL BUSY — ${nodeLabel[S.channel.busyNode]||'?'} TX  (${remMs.toFixed(0)} ms)  queue:${qLen}`
+      : `✓ CHANNEL IDLE${qLen > 0 ? `  queue:${qLen}` : ''}`;
+    ctx.fillText(label, barX + barW/2, barY + 13);
+    ctx.textAlign = 'left';
+  }
+
+  // ── Sim time display ──────────────────────────────────────────────────────
   ctx.fillStyle = '#2a4060';
   ctx.font = '11px Courier New';
   ctx.textAlign = 'left';
